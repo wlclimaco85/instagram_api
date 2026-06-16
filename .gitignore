@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+session.json
+timeline.db
+.env
+venv/
