@@ -149,6 +149,8 @@ def login():
     password = os.environ.get("IG_PASSWORD", "")
     if not username or not password:
         print("Credenciais nao definidas. Modo somente-leitura (API publica).")
+        print("Funcionalidades disponiveis: /profile, /posts")
+        print("Funcionalidades bloqueadas: /followers, /following, /likers, /comments, /snapshot")
         return False
     
     try:
@@ -158,8 +160,13 @@ def login():
         LOGIN_OK = True
         return True
     except Exception as e:
+        err = str(e)
         print(f"Falha no login: {e}")
+        if "BadPassword" in err or "blacklist" in err.lower():
+            print("IP banido pelo Instagram. Use proxy ou VPN para contornar.")
         print("Modo somente-leitura (API publica).")
+        print("Funcionalidades disponiveis: /profile, /posts")
+        print("Funcionalidades bloqueadas: /followers, /following, /likers, /comments, /snapshot")
         return False
 
 class InstagramHandler(BaseHTTPRequestHandler):
