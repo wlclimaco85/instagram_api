@@ -18,6 +18,13 @@ from urllib.parse import urlparse, parse_qs
 # Desabilita aviso de SSL não verificado (problema de CA no Windows/Python 3.14)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# Patch global: força verify=False em todas as requests.Session (SSLCertVerificationError no instagrapi)
+_orig_requests_send = http_requests.Session.send
+def _requests_send_no_verify(self, *args, **kwargs):
+    kwargs['verify'] = False
+    return _orig_requests_send(self, *args, **kwargs)
+http_requests.Session.send = _requests_send_no_verify
+
 try:
     from instagrapi import Client
     from instagrapi.exceptions import (
@@ -380,7 +387,7 @@ def track_profile(username):
     conn.close()
 
 def _carregar_sessao():
-    """Carrega session.json sem chamar login() — zero request ao Instagram na subida."""
+    """Injeta cookies do browser diretamente no instagrapi — sem chamada de verificação (evita 467/consent_required)."""
     global LOGIN_OK
     if not _INSTAGRAPI_OK:
         print("instagrapi nao instalado. Modo somente-leitura.")
@@ -390,9 +397,16 @@ def _carregar_sessao():
         print("Modo somente-leitura ativo. Endpoints: /profile, /posts")
         return
     try:
-        cl.load_settings(SESSION_FILE)
-        if not cl.user_id:
-            raise ValueError("session.json invalido (user_id ausente)")
+        with open(SESSION_FILE) as f:
+            session_data = json.load(f)
+        cookies = session_data.get("cookies", {})
+        sessionid = cookies.get("sessionid") or session_data.get("authorization_data", {}).get("sessionid")
+        csrftoken = cookies.get("csrftoken", "")
+        ds_user_id = str(cookies.get("ds_user_id", "") or session_data.get("authorization_data", {}).get("ds_user_id", ""))
+        if not sessionid:
+            raise ValueError("sessionid ausente no session.json")
+        cl.private.cookies.update({"sessionid": sessionid, "csrftoken": csrftoken, "ds_user_id": ds_user_id})
+        cl.public.cookies.update({"sessionid": sessionid, "csrftoken": csrftoken, "ds_user_id": ds_user_id})
         LOGIN_OK = True
         print(f"Sessao carregada: user_id={cl.user_id}")
         print("Modo autenticado ativo. Todos os endpoints disponiveis.")
@@ -470,7 +484,11 @@ class InstagramHandler(BaseHTTPRequestHandler):
             self.send_json({"status": "ok"})
         
         elif parsed.path == "/login_status":
-            self.send_json({"login_ok": False, "mode": "readonly"})
+            self.send_json({
+                "login_ok": LOGIN_OK,
+                "mode": "authenticated" if LOGIN_OK else "readonly",
+                "username": cl.username if LOGIN_OK and cl else None,
+            })
         
         elif parsed.path == "/profile":
             username = params.get("username", [""])[0]
@@ -492,7 +510,7 @@ class InstagramHandler(BaseHTTPRequestHandler):
                         "is_private": user.is_private,
                         "is_verified": user.is_verified,
                         "external_url": str(user.external_url) if user.external_url else None,
-                        "hd_profile_pic": str(user.hd_profile_pic_url_info.url) if user.hd_profile_pic_url_info else None,
+                        "hd_profile_pic": str(user.profile_pic_url_hd) if user.profile_pic_url_hd else None,
                     }
                 except (LoginRequired, ClientLoginRequired):
                     _invalidar_sessao()
