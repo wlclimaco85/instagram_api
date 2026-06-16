@@ -12,8 +12,16 @@ import time
 import requests as http_requests
 import urllib3
 from datetime import datetime, timedelta
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
+
+# Força UTF-8 no console: sem isto, o cp1252 do Windows quebra o print() ao logar
+# mensagens de erro com '→'/emoji, mascarando a causa real do erro (charmap codec).
+for _fluxo in (sys.stdout, sys.stderr):
+    try:
+        _fluxo.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 # Desabilita aviso de SSL não verificado (problema de CA no Windows/Python 3.14)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -46,7 +54,13 @@ if os.path.exists(_env_path):
                 os.environ.setdefault(_chave.strip(), _valor.strip())
 
 SESSION_FILE = os.path.join(os.path.dirname(__file__), "session.json")
+SESSIONS_FILE = os.path.join(os.path.dirname(__file__), "sessions.json")
 DB_FILE = os.path.join(os.path.dirname(__file__), "timeline.db")
+
+# Pool de sessões: várias contas para o job horário rotacionar quando uma
+# entra em soft-block (429/login_required) ou é invalidada pelo Instagram.
+_sessoes = []      # lista de {"label": str, "cookies": {sessionid, csrftoken, ds_user_id}}
+_sessao_idx = 0    # índice da sessão ativa no pool
 
 def _novo_client():
     """Cria Client do instagrapi com SSL desabilitado (SSLCertVerificationError no Windows/Python 3.14)."""
@@ -386,41 +400,154 @@ def track_profile(username):
     conn.commit()
     conn.close()
 
+def _extrair_cookies(dados):
+    """Extrai sessionid/csrftoken/ds_user_id de um dict de sessão (formato browser ou instagrapi)."""
+    if not isinstance(dados, dict):
+        return None
+    cookies = dados.get("cookies", {})
+    auth = dados.get("authorization_data", {})
+    sessionid = cookies.get("sessionid") or auth.get("sessionid")
+    if not sessionid:
+        return None
+    csrftoken = cookies.get("csrftoken", "")
+    ds_user_id = str(cookies.get("ds_user_id", "") or auth.get("ds_user_id", ""))
+    return {"sessionid": sessionid, "csrftoken": csrftoken, "ds_user_id": ds_user_id}
+
+
+def _aplicar_sessao(idx):
+    """Injeta os cookies da sessão idx do pool no client global e ativa o modo autenticado."""
+    global LOGIN_OK, _sessao_idx
+    cookies = _sessoes[idx]["cookies"]
+    cl.private.cookies.update(cookies)
+    cl.public.cookies.update(cookies)
+    _sessao_idx = idx
+    LOGIN_OK = True
+
+
 def _carregar_sessao():
-    """Injeta cookies do browser diretamente no instagrapi — sem chamada de verificação (evita 467/consent_required)."""
-    global LOGIN_OK
+    """Carrega o pool de sessões e ativa a primeira.
+
+    Prioriza sessions.json (lista de contas para rotação); se ausente, usa o
+    session.json único (retrocompatível). Injeta cookies direto, sem chamada de
+    verificação (evita 467/consent_required).
+    """
+    global _sessoes
     if not _INSTAGRAPI_OK:
         print("instagrapi nao instalado. Modo somente-leitura.")
         return
-    if not os.path.exists(SESSION_FILE):
-        print("session.json nao encontrado. Rode: python server.py --setup-session")
+
+    brutas = []
+    if os.path.exists(SESSIONS_FILE):
+        try:
+            with open(SESSIONS_FILE, encoding="utf-8") as f:
+                conteudo = json.load(f)
+            brutas = conteudo.get("sessions", []) if isinstance(conteudo, dict) else conteudo
+        except Exception as e:
+            print(f"Falha ao ler sessions.json: {e}")
+    elif os.path.exists(SESSION_FILE):
+        try:
+            with open(SESSION_FILE, encoding="utf-8") as f:
+                brutas = [json.load(f)]
+        except Exception as e:
+            print(f"Falha ao ler session.json: {e}")
+
+    _sessoes = []
+    for i, dados in enumerate(brutas):
+        cookies = _extrair_cookies(dados)
+        if cookies:
+            label = dados.get("label", f"sessao{i + 1}")
+            _sessoes.append({"label": label, "cookies": cookies})
+
+    if not _sessoes:
+        print("Nenhuma sessao valida (sessions.json/session.json). Rode: python server.py --setup-session")
         print("Modo somente-leitura ativo. Endpoints: /profile, /posts")
         return
-    try:
-        with open(SESSION_FILE) as f:
-            session_data = json.load(f)
-        cookies = session_data.get("cookies", {})
-        sessionid = cookies.get("sessionid") or session_data.get("authorization_data", {}).get("sessionid")
-        csrftoken = cookies.get("csrftoken", "")
-        ds_user_id = str(cookies.get("ds_user_id", "") or session_data.get("authorization_data", {}).get("ds_user_id", ""))
-        if not sessionid:
-            raise ValueError("sessionid ausente no session.json")
-        cl.private.cookies.update({"sessionid": sessionid, "csrftoken": csrftoken, "ds_user_id": ds_user_id})
-        cl.public.cookies.update({"sessionid": sessionid, "csrftoken": csrftoken, "ds_user_id": ds_user_id})
-        LOGIN_OK = True
-        print(f"Sessao carregada: user_id={cl.user_id}")
-        print("Modo autenticado ativo. Todos os endpoints disponiveis.")
-    except Exception as e:
-        print(f"Falha ao carregar session.json: {e}")
-        print("Rode: python server.py --setup-session para renovar a sessao.")
-        print("Modo somente-leitura ativo. Endpoints: /profile, /posts")
+
+    _aplicar_sessao(0)
+    print(f"Pool de sessoes carregado: {len(_sessoes)} sessao(oes). Ativa: '{_sessoes[0]['label']}' (user_id={cl.user_id})")
+    print("Modo autenticado ativo. Todos os endpoints disponiveis.")
+
+
+def _rotacionar_sessao():
+    """Troca para a próxima sessão do pool. Retorna False se há apenas uma sessão."""
+    if len(_sessoes) <= 1:
+        return False
+    proximo = (_sessao_idx + 1) % len(_sessoes)
+    _aplicar_sessao(proximo)
+    print(f"[POOL] Rotacionando para sessao '{_sessoes[proximo]['label']}' (idx {proximo})")
+    return True
 
 
 def _invalidar_sessao():
-    """Marca sessao como expirada — chamado quando request retorna erro de auth."""
+    """Sessão rejeitada pelo IG nesta request (geralmente soft-block 429/login_required, transitório).
+
+    Rotaciona para outra conta se houver. NÃO desliga o modo autenticado por um
+    login_required isolado: o soft-block volta sozinho e endpoints com fallback
+    GraphQL (ex.: /comments) seguem funcionando. Readonly só quando não há
+    nenhuma sessão carregada no pool.
+    """
     global LOGIN_OK
-    LOGIN_OK = False
-    print("Sessao expirada detectada. Rode: python server.py --setup-session")
+    if not _sessoes:
+        LOGIN_OK = False
+        print("Nenhuma sessao no pool. Rode: python server.py --setup-session")
+        return
+    _rotacionar_sessao()  # troca de conta se houver backup; mantém autenticado de qualquer forma
+
+
+def chamar_autenticado(operacao):
+    """Executa uma operação autenticada com rotação automática de sessão.
+
+    Tenta com a sessão ativa; se o IG responder login_required/429/rate-limit,
+    rotaciona para a próxima sessão do pool e tenta de novo, até esgotar o pool.
+    Re-levanta a última exceção se todas falharem.
+    """
+    tentativas = max(1, len(_sessoes))
+    ultima_exc = None
+    for _ in range(tentativas):
+        try:
+            return operacao()
+        except (LoginRequired, ClientLoginRequired) as e:
+            ultima_exc = e
+        except Exception as e:
+            msg = str(e).lower()
+            if any(t in msg for t in ("429", "login_required", "rate", "max retries")):
+                ultima_exc = e
+            else:
+                raise
+        if not _rotacionar_sessao():
+            break
+    if ultima_exc:
+        raise ultima_exc
+
+
+def _ds_user_id_do_sessionid(sessionid):
+    """Extrai o ds_user_id do início do sessionid (formato '<id>%3A<resto>' ou '<id>:<resto>')."""
+    from urllib.parse import unquote
+    texto = unquote(sessionid or "")
+    return texto.split(":", 1)[0] if ":" in texto else ""
+
+
+def salvar_sessions(entradas):
+    """Normaliza e grava o pool em sessions.json. Aceita cada entrada como
+    {"label","sessionid","csrftoken"} ou {"label","cookies":{...}}. O ds_user_id
+    é derivado do próprio sessionid quando não informado."""
+    sessoes = []
+    for i, entrada in enumerate(entradas):
+        cookies = entrada.get("cookies") if isinstance(entrada, dict) else None
+        if not cookies:
+            sessionid = (entrada.get("sessionid") or "").strip()
+            if not sessionid:
+                continue
+            cookies = {
+                "sessionid": sessionid,
+                "csrftoken": (entrada.get("csrftoken") or "").strip(),
+                "ds_user_id": (entrada.get("ds_user_id") or "").strip() or _ds_user_id_do_sessionid(sessionid),
+            }
+        label = (entrada.get("label") or f"sessao{i + 1}").strip()
+        sessoes.append({"label": label, "cookies": cookies})
+    with open(SESSIONS_FILE, "w", encoding="utf-8") as f:
+        json.dump({"sessions": sessoes}, f, ensure_ascii=False, indent=2)
+    return len(sessoes)
 
 
 def _erro_auth():
@@ -428,6 +555,50 @@ def _erro_auth():
         "error": "auth_required",
         "message": "Sessao expirada ou ausente. Rode: python server.py --setup-session no servidor.",
     }
+
+
+def _normalizar_comentario_objeto(c):
+    """Normaliza um Comment da private API (objeto instagrapi)."""
+    return {
+        "username": c.user.username,
+        "full_name": c.user.full_name or "",
+        "text": c.text,
+        "timestamp": str(c.created_at),
+        "likes": c.like_count or 0,
+    }
+
+
+def _normalizar_comentario_dict(c):
+    """Normaliza um comentário cru do GraphQL público (dict). Não traz full_name."""
+    usuario = c.get("user", {})
+    return {
+        "username": usuario.get("username", ""),
+        "full_name": usuario.get("full_name", ""),
+        "text": c.get("text", ""),
+        "timestamp": str(c.get("created_at", "")),
+        "likes": c.get("comment_like_count", 0) or 0,
+    }
+
+
+def coletar_comentarios(media_id, amount=50):
+    """Coleta comentários de um post resiliente a soft-block.
+
+    A private API é mais completa, mas em soft-block (429/login_required) o
+    Instagram a rejeita. Nesse caso cai para o GraphQL público
+    (media_comments_gql), que segue funcionando com a mesma sessão — por isso
+    o LoginRequired aqui NÃO invalida a sessão, apenas troca de método.
+    """
+    try:
+        comentarios = chamar_autenticado(lambda: cl.media_comments(media_id, amount=amount))
+        if comentarios:
+            return [_normalizar_comentario_objeto(c) for c in comentarios]
+    except (LoginRequired, ClientLoginRequired):
+        print(f"[/comments] private bloqueada (login_required) → fallback GraphQL")
+    except Exception as e:
+        print(f"[/comments] private falhou ({type(e).__name__}) → fallback GraphQL")
+
+    gql = cl.media_comments_gql(media_id, amount=amount)
+    return [_normalizar_comentario_dict(c) for c in gql]
 
 
 def _handle_cl_exception(e, handler_self):
@@ -488,6 +659,14 @@ class InstagramHandler(BaseHTTPRequestHandler):
                 "login_ok": LOGIN_OK,
                 "mode": "authenticated" if LOGIN_OK else "readonly",
                 "username": cl.username if LOGIN_OK and cl else None,
+            })
+
+        elif parsed.path == "/sessions":
+            self.send_json({
+                "total": len(_sessoes),
+                "ativa": _sessoes[_sessao_idx]["label"] if _sessoes else None,
+                "labels": [s["label"] for s in _sessoes],
+                "login_ok": LOGIN_OK,
             })
         
         elif parsed.path == "/profile":
@@ -569,7 +748,7 @@ class InstagramHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": "media_id required"}, 400)
                 return
             try:
-                likers = cl.media_likers(int(media_id))
+                likers = chamar_autenticado(lambda: cl.media_likers(int(media_id)))
                 data = [{"username": l.username, "full_name": l.full_name} for l in likers]
                 self.send_json({"likers": data, "count": len(data)})
             except Exception as e:
@@ -585,8 +764,8 @@ class InstagramHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": "username required"}, 400)
                 return
             try:
-                user = cl.user_info_by_username(username)
-                followers = cl.user_followers(user.pk, amount=amount)
+                user = chamar_autenticado(lambda: cl.user_info_by_username(username))
+                followers = chamar_autenticado(lambda: cl.user_followers(user.pk, amount=amount))
                 data = [{"username": f.username, "full_name": f.full_name} for f in followers.values()]
                 self.send_json({"followers": data, "count": len(data)})
             except Exception as e:
@@ -602,8 +781,8 @@ class InstagramHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": "username required"}, 400)
                 return
             try:
-                user = cl.user_info_by_username(username)
-                following = cl.user_following(user.pk, amount=amount)
+                user = chamar_autenticado(lambda: cl.user_info_by_username(username))
+                following = chamar_autenticado(lambda: cl.user_following(user.pk, amount=amount))
                 data = [{"username": f.username, "full_name": f.full_name} for f in following.values()]
                 self.send_json({"following": data, "count": len(data)})
             except Exception as e:
@@ -614,18 +793,12 @@ class InstagramHandler(BaseHTTPRequestHandler):
                 self.send_json(_erro_auth(), 401)
                 return
             media_id = params.get("media_id", [""])[0]
+            amount = int(params.get("amount", ["50"])[0])
             if not media_id:
                 self.send_json({"error": "media_id required"}, 400)
                 return
             try:
-                comments = cl.media_comments(int(media_id))
-                data = [{
-                    "username": c.user.username,
-                    "full_name": c.user.full_name,
-                    "text": c.text,
-                    "timestamp": str(c.created_at),
-                    "likes": c.like_count or 0,
-                } for c in comments]
+                data = coletar_comentarios(int(media_id), amount)
                 self.send_json({"comments": data, "count": len(data)})
             except Exception as e:
                 _handle_cl_exception(e, self)
@@ -809,11 +982,45 @@ class InstagramHandler(BaseHTTPRequestHandler):
         
         else:
             self.send_json({"error": "endpoint not found"}, 404)
-    
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        if parsed.path == "/sessions":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length).decode("utf-8") if length else "{}"
+                payload = json.loads(body)
+                entradas = payload.get("sessions", [])
+                if not isinstance(entradas, list) or not entradas:
+                    self.send_json({"error": "Informe ao menos uma sessao"}, 400)
+                    return
+                total = salvar_sessions(entradas)
+                _carregar_sessao()  # recarrega o pool em runtime, sem reiniciar
+                self.send_json({
+                    "status": "saved",
+                    "total": total,
+                    "ativa": _sessoes[_sessao_idx]["label"] if _sessoes else None,
+                    "login_ok": LOGIN_OK,
+                })
+            except Exception as e:
+                self.send_json({"error": str(e)}, 400)
+        else:
+            self.send_json({"error": "endpoint not found"}, 404)
+
+    def do_OPTIONS(self):
+        # Preflight CORS para o POST com Content-Type application/json vindo do Flutter web.
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.end_headers()
+
     def send_json(self, data, status=200):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.end_headers()
         self.wfile.write(json.dumps(data, ensure_ascii=False).encode())
     
@@ -833,10 +1040,32 @@ def main():
     _carregar_sessao()
     
     port = int(os.environ.get("PORT", 8500))
-    server = HTTPServer(("0.0.0.0", port), InstagramHandler)
+
+    # ThreadingHTTPServer: uma request lenta (instagrapi em retries no soft-block)
+    # não trava nem derruba o servidor inteiro como acontecia no HTTPServer single-thread.
+    ThreadingHTTPServer.allow_reuse_address = True
+    ThreadingHTTPServer.daemon_threads = True
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", port), InstagramHandler)
+    except OSError as e:
+        print(f"[ERRO] Nao foi possivel abrir a porta {port}: {e}")
+        print("Provavel causa: ja existe um server.py rodando nessa porta.")
+        print("Encerre o processo anterior (ou rode _kill_servers.ps1) e tente de novo.")
+        return
+
     print(f"Instagram API rodando em http://0.0.0.0:{port}")
-    print("Endpoints: /profile, /posts, /likers, /followers, /following, /comments, /snapshot, /timeline, /track")
-    server.serve_forever()
+    print("Endpoints: /profile, /posts, /likers, /followers, /following, /comments, /snapshot, /timeline, /track, /sessions")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nEncerrando servidor (Ctrl+C).")
+    except Exception:
+        # Sem isto, um erro fatal derrubava o processo sem deixar rastro ("caiu do nada").
+        import traceback
+        print("[FATAL] serve_forever encerrou por exceção:")
+        traceback.print_exc()
+    finally:
+        server.server_close()
 
 if __name__ == "__main__":
     main()

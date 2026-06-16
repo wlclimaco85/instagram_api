@@ -1,0 +1,7 @@
+Sessao carregada: user_id=12976827628
+Modo autenticado ativo. Todos os endpoints disponiveis.
+Instagram API rodando em http://0.0.0.0:8500
+Endpoints: /profile, /posts, /likers, /followers, /following, /comments, /snapshot, /timeline, /track
+[16/Jun/2026 19:26:39] GET /login_status HTTP/1.1
+[/comments] private bloqueada (login_required) → fallback GraphQL
+[16/Jun/2026 19:26:43] GET /comments?media_id=3918726773265025717 HTTP/1.1

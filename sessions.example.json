@@ -1,0 +1,21 @@
+{
+  "_comentario": "Pool de sessoes para o job horario rotacionar quando uma conta entra em soft-block (429/login_required) ou e invalidada. Copie este arquivo para 'sessions.json' (ignorado pelo git) e preencha com cookies reais. Se 'sessions.json' nao existir, o servidor usa o 'session.json' unico como 1 sessao.",
+  "sessions": [
+    {
+      "label": "conta_principal",
+      "cookies": {
+        "sessionid": "COLE_O_SESSIONID_DA_CONTA_1",
+        "csrftoken": "COLE_O_CSRFTOKEN_DA_CONTA_1",
+        "ds_user_id": "COLE_O_DS_USER_ID_DA_CONTA_1"
+      }
+    },
+    {
+      "label": "conta_backup",
+      "cookies": {
+        "sessionid": "COLE_O_SESSIONID_DA_CONTA_2",
+        "csrftoken": "COLE_O_CSRFTOKEN_DA_CONTA_2",
+        "ds_user_id": "COLE_O_DS_USER_ID_DA_CONTA_2"
+      }
+    }
+  ]
+}

@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 session.json
+sessions.json
 timeline.db
 .env
 venv/
