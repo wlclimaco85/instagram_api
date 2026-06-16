@@ -456,7 +456,7 @@ def _carregar_sessao():
         cookies = _extrair_cookies(dados)
         if cookies:
             label = dados.get("label", f"sessao{i + 1}")
-            _sessoes.append({"label": label, "cookies": cookies})
+            _sessoes.append({"label": label, "cookies": cookies, "has_error": False})
 
     if not _sessoes:
         print("Nenhuma sessao valida (sessions.json/session.json). Rode: python server.py --setup-session")
@@ -508,10 +508,14 @@ def chamar_autenticado(operacao):
             return operacao()
         except (LoginRequired, ClientLoginRequired) as e:
             ultima_exc = e
+            if _sessoes:
+                _sessoes[_sessao_idx]["has_error"] = True
         except Exception as e:
             msg = str(e).lower()
             if any(t in msg for t in ("429", "login_required", "rate", "max retries")):
                 ultima_exc = e
+                if _sessoes:
+                    _sessoes[_sessao_idx]["has_error"] = True
             else:
                 raise
         if not _rotacionar_sessao():
@@ -667,6 +671,14 @@ class InstagramHandler(BaseHTTPRequestHandler):
                 "ativa": _sessoes[_sessao_idx]["label"] if _sessoes else None,
                 "labels": [s["label"] for s in _sessoes],
                 "login_ok": LOGIN_OK,
+                "sessions_list": [
+                    {
+                        "label": s["label"],
+                        "is_active": (i == _sessao_idx),
+                        "has_error": s.get("has_error", False),
+                    }
+                    for i, s in enumerate(_sessoes)
+                ],
             })
         
         elif parsed.path == "/profile":
@@ -983,6 +995,33 @@ class InstagramHandler(BaseHTTPRequestHandler):
         else:
             self.send_json({"error": "endpoint not found"}, 404)
 
+    def do_DELETE(self):
+        parsed = urlparse(self.path)
+        # DELETE /sessions/<label>  — remove uma sessao do pool pelo apelido
+        if parsed.path.startswith("/sessions/"):
+            label = parsed.path[len("/sessions/"):]
+            if not label:
+                self.send_json({"error": "label required"}, 400)
+                return
+            global _sessoes, _sessao_idx
+            antes = len(_sessoes)
+            _sessoes = [s for s in _sessoes if s["label"] != label]
+            if len(_sessoes) < antes:
+                # Salva o pool atualizado em disco
+                with open(SESSIONS_FILE, "w", encoding="utf-8") as f:
+                    json.dump({"sessions": _sessoes}, f, ensure_ascii=False, indent=2)
+                # Reajusta o indice ativo
+                if _sessoes:
+                    _sessao_idx = min(_sessao_idx, len(_sessoes) - 1)
+                    _aplicar_sessao(_sessao_idx)
+                else:
+                    _sessao_idx = 0
+                self.send_json({"status": "removed", "label": label, "total": len(_sessoes)})
+            else:
+                self.send_json({"error": f"sessao '{label}' nao encontrada"}, 404)
+        else:
+            self.send_json({"error": "endpoint not found"}, 404)
+
     def do_POST(self):
         parsed = urlparse(self.path)
         if parsed.path == "/sessions":
@@ -1011,7 +1050,7 @@ class InstagramHandler(BaseHTTPRequestHandler):
         # Preflight CORS para o POST com Content-Type application/json vindo do Flutter web.
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.end_headers()
 
@@ -1019,7 +1058,7 @@ class InstagramHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.end_headers()
         self.wfile.write(json.dumps(data, ensure_ascii=False).encode())
