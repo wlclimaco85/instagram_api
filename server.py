@@ -14,6 +14,16 @@ from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
+try:
+    from instagrapi import Client
+    from instagrapi.exceptions import (
+        LoginRequired, ClientLoginRequired, ChallengeRequired,
+        BadPassword, TwoFactorRequired,
+    )
+    _INSTAGRAPI_OK = True
+except ImportError:
+    _INSTAGRAPI_OK = False
+
 # Carrega .env local se existir (credenciais nunca devem ir para o git)
 _env_path = os.path.join(os.path.dirname(__file__), ".env")
 if os.path.exists(_env_path):
@@ -24,7 +34,11 @@ if os.path.exists(_env_path):
                 _chave, _, _valor = _linha.partition("=")
                 os.environ.setdefault(_chave.strip(), _valor.strip())
 
+SESSION_FILE = os.path.join(os.path.dirname(__file__), "session.json")
 DB_FILE = os.path.join(os.path.dirname(__file__), "timeline.db")
+
+cl = Client() if _INSTAGRAPI_OK else None
+LOGIN_OK = False
 
 # --- TTL Cache simples -------------------------------------------------------
 
@@ -342,8 +356,85 @@ def track_profile(username):
     conn.commit()
     conn.close()
 
+def _carregar_sessao():
+    """Carrega session.json sem chamar login() — zero request ao Instagram na subida."""
+    global LOGIN_OK
+    if not _INSTAGRAPI_OK:
+        print("instagrapi nao instalado. Modo somente-leitura.")
+        return
+    if not os.path.exists(SESSION_FILE):
+        print("session.json nao encontrado. Rode: python server.py --setup-session")
+        print("Modo somente-leitura ativo. Endpoints: /profile, /posts")
+        return
+    try:
+        cl.load_settings(SESSION_FILE)
+        if not cl.user_id:
+            raise ValueError("session.json invalido (user_id ausente)")
+        LOGIN_OK = True
+        print(f"Sessao carregada: user_id={cl.user_id}")
+        print("Modo autenticado ativo. Todos os endpoints disponiveis.")
+    except Exception as e:
+        print(f"Falha ao carregar session.json: {e}")
+        print("Rode: python server.py --setup-session para renovar a sessao.")
+        print("Modo somente-leitura ativo. Endpoints: /profile, /posts")
+
+
+def _invalidar_sessao():
+    """Marca sessao como expirada — chamado quando request retorna erro de auth."""
+    global LOGIN_OK
+    LOGIN_OK = False
+    print("Sessao expirada detectada. Rode: python server.py --setup-session")
+
+
 def _erro_auth():
-    return {"error": "auth_required", "message": "Funcionalidade requer autenticacao. Endpoints disponiveis sem login: /profile, /posts"}
+    return {
+        "error": "auth_required",
+        "message": "Sessao expirada ou ausente. Rode: python server.py --setup-session no servidor.",
+    }
+
+
+def _handle_cl_exception(e, handler_self):
+    """Trata excecoes do instagrapi e decide se invalida sessao ou retorna 500."""
+    err = str(e)
+    if any(t in type(e).__name__ for t in ("LoginRequired", "ClientLoginRequired")):
+        _invalidar_sessao()
+        handler_self.send_json(_erro_auth(), 401)
+    elif "401" in err or "login" in err.lower():
+        _invalidar_sessao()
+        handler_self.send_json(_erro_auth(), 401)
+    else:
+        handler_self.send_json({"error": err}, 500)
+
+
+def setup_session_interativo():
+    """Modo interativo para login com suporte a challenge (email/SMS/2FA)."""
+    if not _INSTAGRAPI_OK:
+        print("ERRO: instagrapi nao instalado. Execute: pip install instagrapi")
+        sys.exit(1)
+
+    username = os.environ.get("IG_USERNAME") or input("Instagram username: ").strip()
+    password = os.environ.get("IG_PASSWORD") or input("Instagram password: ").strip()
+
+    ig = Client()
+
+    def _challenge_handler(u, choice):
+        print(f"\nInstagram enviou um codigo para: {choice.name}")
+        return input("Digite o codigo recebido: ").strip()
+
+    ig.challenge_code_handler = _challenge_handler
+
+    try:
+        ig.login(username, password)
+    except TwoFactorRequired:
+        code = input("Codigo 2FA: ").strip()
+        ig.login(username, password, verification_code=code)
+    except ChallengeRequired:
+        print("Challenge necessario — verifique e-mail ou SMS do Instagram.")
+        raise
+
+    ig.dump_settings(SESSION_FILE)
+    print(f"\nSessao salva em: {SESSION_FILE}")
+    print("Reinicie o servidor. A partir de agora ele carrega a sessao sem fazer login.")
 
 class InstagramHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -361,7 +452,29 @@ class InstagramHandler(BaseHTTPRequestHandler):
             if not username:
                 self.send_json({"error": "username required"}, 400)
                 return
-            data = fetch_profile_public(username)
+            data = None
+            if LOGIN_OK:
+                try:
+                    user = cl.user_info_by_username(username)
+                    data = {
+                        "username": user.username,
+                        "full_name": user.full_name,
+                        "biography": user.biography,
+                        "profile_pic_url": str(user.profile_pic_url) if user.profile_pic_url else None,
+                        "followers": user.follower_count,
+                        "following": user.following_count,
+                        "posts": user.media_count,
+                        "is_private": user.is_private,
+                        "is_verified": user.is_verified,
+                        "external_url": str(user.external_url) if user.external_url else None,
+                        "hd_profile_pic": str(user.hd_profile_pic_url_info.url) if user.hd_profile_pic_url_info else None,
+                    }
+                except (LoginRequired, ClientLoginRequired):
+                    _invalidar_sessao()
+                except Exception as e:
+                    print(f"instagrapi profile error: {e}")
+            if data is None:
+                data = fetch_profile_public(username)
             if data and data.get("error") == "rate_limited":
                 self.send_json(data, 429)
             elif data and data.get("error") == "auth_required":
@@ -380,20 +493,99 @@ class InstagramHandler(BaseHTTPRequestHandler):
             if not username:
                 self.send_json({"error": "username required"}, 400)
                 return
-            posts = fetch_posts_public(username, amount)
+            posts = []
+            if LOGIN_OK:
+                try:
+                    user = cl.user_info_by_username(username)
+                    medias = cl.user_medias(user.pk, amount=amount)
+                    for m in medias:
+                        posts.append({
+                            "id": str(m.pk),
+                            "display_url": str(m.thumbnail_url) if m.thumbnail_url else None,
+                            "caption": (m.caption_text or "")[:200],
+                            "likes": m.like_count or 0,
+                            "comments": m.comment_count or 0,
+                            "timestamp": str(m.taken_at),
+                            "is_video": m.media_type == 2,
+                            "video_url": str(m.video_url) if m.media_type == 2 and m.video_url else None,
+                        })
+                except (LoginRequired, ClientLoginRequired):
+                    _invalidar_sessao()
+                except Exception as e:
+                    print(f"instagrapi posts error: {e}")
+            if not posts:
+                posts = fetch_posts_public(username, amount)
             self.send_json({"posts": posts, "count": len(posts)})
         
         elif parsed.path == "/likers":
-            self.send_json(_erro_auth(), 401)
+            if not LOGIN_OK:
+                self.send_json(_erro_auth(), 401)
+                return
+            media_id = params.get("media_id", [""])[0]
+            if not media_id:
+                self.send_json({"error": "media_id required"}, 400)
+                return
+            try:
+                likers = cl.media_likers(int(media_id))
+                data = [{"username": l.username, "full_name": l.full_name} for l in likers]
+                self.send_json({"likers": data, "count": len(data)})
+            except Exception as e:
+                _handle_cl_exception(e, self)
         
         elif parsed.path == "/followers":
-            self.send_json(_erro_auth(), 401)
+            if not LOGIN_OK:
+                self.send_json(_erro_auth(), 401)
+                return
+            username = params.get("username", [""])[0]
+            amount = int(params.get("amount", ["200"])[0])
+            if not username:
+                self.send_json({"error": "username required"}, 400)
+                return
+            try:
+                user = cl.user_info_by_username(username)
+                followers = cl.user_followers(user.pk, amount=amount)
+                data = [{"username": f.username, "full_name": f.full_name} for f in followers.values()]
+                self.send_json({"followers": data, "count": len(data)})
+            except Exception as e:
+                _handle_cl_exception(e, self)
         
         elif parsed.path == "/following":
-            self.send_json(_erro_auth(), 401)
+            if not LOGIN_OK:
+                self.send_json(_erro_auth(), 401)
+                return
+            username = params.get("username", [""])[0]
+            amount = int(params.get("amount", ["200"])[0])
+            if not username:
+                self.send_json({"error": "username required"}, 400)
+                return
+            try:
+                user = cl.user_info_by_username(username)
+                following = cl.user_following(user.pk, amount=amount)
+                data = [{"username": f.username, "full_name": f.full_name} for f in following.values()]
+                self.send_json({"following": data, "count": len(data)})
+            except Exception as e:
+                _handle_cl_exception(e, self)
         
         elif parsed.path == "/comments":
-            self.send_json(_erro_auth(), 401)
+            if not LOGIN_OK:
+                self.send_json(_erro_auth(), 401)
+                return
+            media_id = params.get("media_id", [""])[0]
+            if not media_id:
+                self.send_json({"error": "media_id required"}, 400)
+                return
+            try:
+                comments = cl.media_comments(int(media_id))
+                data = [{
+                    "username": c.user.username,
+                    "full_name": c.user.full_name,
+                    "text": c.text,
+                    "timestamp": str(c.created_at),
+                    "likes": c.like_count or 0,
+                } for c in comments]
+                self.send_json({"comments": data, "count": len(data)})
+            except Exception as e:
+                _handle_cl_exception(e, self)
 
         elif parsed.path == "/track":
             username = params.get("username", [""])[0]
@@ -404,7 +596,47 @@ class InstagramHandler(BaseHTTPRequestHandler):
             self.send_json({"status": "tracking", "username": username})
 
         elif parsed.path == "/snapshot":
-            self.send_json(_erro_auth(), 401)
+            if not LOGIN_OK:
+                self.send_json(_erro_auth(), 401)
+                return
+            username = params.get("username", [""])[0]
+            if not username:
+                self.send_json({"error": "username required"}, 400)
+                return
+            try:
+                user = cl.user_info_by_username(username)
+                track_profile(username)
+
+                followers = cl.user_followers(user.pk, amount=200)
+                follower_list = [{"username": f.username, "full_name": f.full_name}
+                                 for f in followers.values()]
+                save_snapshot(username, "followers", follower_list)
+
+                time.sleep(2.0)
+                following = cl.user_following(user.pk, amount=200)
+                following_list = [{"username": f.username, "full_name": f.full_name}
+                                  for f in following.values()]
+                save_snapshot(username, "following", following_list)
+
+                time.sleep(2.0)
+                medias = cl.user_medias(user.pk, amount=12)
+                post_likes = {}
+                for m in medias:
+                    time.sleep(2.0)
+                    likers = cl.media_likers(m.pk)
+                    post_likes[str(m.pk)] = [{"username": l.username, "full_name": l.full_name}
+                                              for l in likers]
+                save_snapshot(username, "post_likes", post_likes)
+
+                self.send_json({
+                    "status": "snapshot_saved",
+                    "username": username,
+                    "followers": len(follower_list),
+                    "following": len(following_list),
+                    "posts_liked": len(post_likes),
+                })
+            except Exception as e:
+                _handle_cl_exception(e, self)
 
         elif parsed.path == "/timeline":
             username = params.get("username", [""])[0]
@@ -494,7 +726,34 @@ class InstagramHandler(BaseHTTPRequestHandler):
                     self.send_json({"error": err}, 500)
 
         elif parsed.path == "/comments_with_timeline":
-            self.send_json(_erro_auth(), 401)
+            if not LOGIN_OK:
+                self.send_json(_erro_auth(), 401)
+                return
+            username = params.get("username", [""])[0]
+            if not username:
+                self.send_json({"error": "username required"}, 400)
+                return
+            try:
+                user = cl.user_info_by_username(username)
+                medias = cl.user_medias(user.pk, amount=12)
+                all_comments = []
+                for m in medias:
+                    time.sleep(1.5)
+                    comments = cl.media_comments(m.pk)
+                    for c in comments:
+                        all_comments.append({
+                            "type": "comment",
+                            "username": c.user.username,
+                            "full_name": c.user.full_name,
+                            "text": c.text,
+                            "post_id": str(m.pk),
+                            "likes": c.like_count or 0,
+                            "date": str(c.created_at),
+                        })
+                all_comments.sort(key=lambda e: e.get("date", ""), reverse=True)
+                self.send_json({"comments": all_comments, "count": len(all_comments)})
+            except Exception as e:
+                _handle_cl_exception(e, self)
 
         elif parsed.path == "/tracked":
             conn = sqlite3.connect(DB_FILE)
@@ -519,12 +778,16 @@ class InstagramHandler(BaseHTTPRequestHandler):
         print(f"[{self.log_date_time_string()}] {args[0]}")
 
 def main():
+    if "--setup-session" in sys.argv:
+        setup_session_interativo()
+        return
+
     init_db()
 
     if PROXY_URL:
         print(f"Proxy configurado: {PROXY_URL}")
 
-    print("Modo somente-leitura (sem login). Endpoints disponiveis: /profile, /posts")
+    _carregar_sessao()
     
     port = int(os.environ.get("PORT", 8500))
     server = HTTPServer(("0.0.0.0", port), InstagramHandler)
