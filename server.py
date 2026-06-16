@@ -273,7 +273,12 @@ def fetch_profile_public(username):
         _cache_perfil.set(username, resultado)
         return resultado
 
-    # Todos falharam — devolve o erro original da API
+    # Todos falharam — garante retorno de erro útil (não None)
+    if erro_api is None:
+        erro_api = {
+            "error": "auth_required",
+            "message": "Nenhum metodo de busca funcionou. Configure session.json: python server.py --setup-session",
+        }
     return erro_api
 
 def fetch_posts_public(username, amount=12):
