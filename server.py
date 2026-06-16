@@ -394,8 +394,9 @@ def main():
     if not login():
         print("Falha no login. Iniciando modo somente-leitura (sem login)...")
     
-    server = HTTPServer(("0.0.0.0", 8500), InstagramHandler)
-    print("Instagram API rodando em http://localhost:8500")
+    port = int(os.environ.get("PORT", 8500))
+    server = HTTPServer(("0.0.0.0", port), InstagramHandler)
+    print(f"Instagram API rodando em http://0.0.0.0:{port}")
     print("Endpoints: /profile, /posts, /likers, /followers, /following, /comments, /snapshot, /timeline, /track")
     server.serve_forever()
 
