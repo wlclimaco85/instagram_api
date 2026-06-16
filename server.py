@@ -10,9 +10,13 @@ import sqlite3
 import sys
 import time
 import requests as http_requests
+import urllib3
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
+
+# Desabilita aviso de SSL não verificado (problema de CA no Windows/Python 3.14)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 try:
     from instagrapi import Client
@@ -103,6 +107,7 @@ def _fetch_profile_via_graphql(username):
             headers=headers,
             proxies=_PROXIES,
             timeout=15,
+            verify=False,
         )
         print(f"[IG-GQL] @{username} → HTTP {r.status_code}")
         if r.status_code != 200:
@@ -140,6 +145,7 @@ def _fetch_profile_via_api(username):
             headers=_headers_aleatorios(),
             proxies=_PROXIES,
             timeout=15,
+            verify=False,
         )
         print(f"[IG-API] @{username} → HTTP {r.status_code}")
         if r.status_code == 429:
@@ -169,11 +175,13 @@ def _fetch_profile_via_api(username):
 
 
 def _fetch_profile_via_html(username):
-    """Fallback: raspa metatags og: da página pública do Instagram."""
+    """Fallback: raspa metatags og: da página pública do Instagram.
+    Usa Googlebot UA para forçar SSR com og: tags (browser UA retorna SPA sem dados).
+    """
     try:
         time.sleep(1.5)
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.5',
         }
@@ -183,17 +191,18 @@ def _fetch_profile_via_html(username):
             proxies=_PROXIES,
             timeout=20,
             allow_redirects=True,
+            verify=False,
         )
         print(f"[IG-HTML] @{username} → HTTP {r.status_code}")
         if r.status_code != 200:
             return None
-        html = r.text
+        html = r.content.decode('utf-8', errors='replace')
 
         def _meta(prop):
             import re
-            m = re.search(rf'<meta\s+property=["\']og:{prop}["\']\s+content=["\'](.*?)["\']', html)
+            m = re.search('property="og:' + prop + '"[^>]*content="([^"]+)"', html)
             if not m:
-                m = re.search(rf'<meta\s+content=["\'](.*?)["\']\s+property=["\']og:{prop}["\']', html)
+                m = re.search('content="([^"]+)"[^>]*property="og:' + prop + '"', html)
             return m.group(1) if m else None
 
         title = _meta('title') or ''
