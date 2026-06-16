@@ -41,7 +41,16 @@ if os.path.exists(_env_path):
 SESSION_FILE = os.path.join(os.path.dirname(__file__), "session.json")
 DB_FILE = os.path.join(os.path.dirname(__file__), "timeline.db")
 
-cl = Client() if _INSTAGRAPI_OK else None
+def _novo_client():
+    """Cria Client do instagrapi com SSL desabilitado (SSLCertVerificationError no Windows/Python 3.14)."""
+    if not _INSTAGRAPI_OK:
+        return None
+    c = Client()
+    c.private.verify = False
+    c.public.verify = False
+    return c
+
+cl = _novo_client()
 LOGIN_OK = False
 
 # --- TTL Cache simples -------------------------------------------------------
@@ -430,6 +439,8 @@ def setup_session_interativo():
     password = os.environ.get("IG_PASSWORD") or input("Instagram password: ").strip()
 
     ig = Client()
+    ig.private.verify = False
+    ig.public.verify = False
 
     def _challenge_handler(u, choice):
         print(f"\nInstagram enviou um codigo para: {choice.name}")
