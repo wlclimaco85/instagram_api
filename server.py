@@ -105,6 +105,101 @@ _cache_posts = TtlCache(ttl=1800)
 PROXY_URL = os.environ.get("PROXY_URL", "").strip()
 _PROXIES = {"https": PROXY_URL, "http": PROXY_URL} if PROXY_URL else None
 
+# --- RapidAPI (Instagram Scraper Stable) ------------------------------------
+
+RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY", "").strip()
+RAPIDAPI_HOST_STABLE = "instagram-scraper-stable-api.p.rapidapi.com"
+
+
+def _rapidapi_headers():
+    return {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "x-rapidapi-key": RAPIDAPI_KEY,
+        "x-rapidapi-host": RAPIDAPI_HOST_STABLE,
+    }
+
+
+def _fetch_posts_rapidapi(username, amount=12):
+    """Busca posts via RapidAPI Stable Scraper. Retorna lista no mesmo formato do /posts interno."""
+    if not RAPIDAPI_KEY:
+        return []
+    try:
+        r = http_requests.post(
+            f"https://{RAPIDAPI_HOST_STABLE}/get_ig_user_posts.php",
+            headers=_rapidapi_headers(),
+            data={"username_or_url": username, "amount": amount, "pagination_token": ""},
+            timeout=25,
+            verify=False,
+        )
+        if r.status_code != 200:
+            print(f"[RAPIDAPI-POSTS] HTTP {r.status_code} para @{username}")
+            return []
+        payload = r.json()
+        if payload.get("error"):
+            print(f"[RAPIDAPI-POSTS] erro API: {payload['error']}")
+            return []
+        posts = []
+        for item in payload.get("posts", []):
+            node = item.get("node", {})
+            candidates = node.get("image_versions2", {}).get("candidates", [])
+            display_url = candidates[0]["url"] if candidates else None
+            caption_obj = node.get("caption") or {}
+            caption = (caption_obj.get("text", "") if isinstance(caption_obj, dict) else "")[:200]
+            taken_at = node.get("taken_at", 0)
+            posts.append({
+                "id": str(node.get("pk", "")),
+                "shortcode": node.get("code", ""),
+                "display_url": display_url,
+                "caption": caption,
+                "likes": node.get("like_count", 0),
+                "comments": node.get("comment_count", 0),
+                "timestamp": str(datetime.fromtimestamp(taken_at)) if taken_at else "",
+                "is_video": node.get("media_type", 1) == 2,
+                "video_url": None,
+            })
+        print(f"[RAPIDAPI-POSTS] @{username} → {len(posts)} posts")
+        return posts
+    except Exception as e:
+        print(f"[RAPIDAPI-POSTS] erro: {e}")
+    return []
+
+
+def _fetch_lista_rapidapi(username, tipo, amount=200):
+    """Busca followers ou following via RapidAPI Stable Scraper.
+    tipo='followers'|'following'. Retorna lista de {username, full_name} ou [] em falha.
+    """
+    if not RAPIDAPI_KEY:
+        return []
+    try:
+        r = http_requests.post(
+            f"https://{RAPIDAPI_HOST_STABLE}/get_ig_user_followers_v2.php",
+            headers=_rapidapi_headers(),
+            data={"username_or_url": username, "data": tipo, "amount": amount, "pagination_token": ""},
+            timeout=35,
+            verify=False,
+        )
+        if r.status_code != 200:
+            print(f"[RAPIDAPI-{tipo.upper()}] HTTP {r.status_code} para @{username}")
+            return []
+        payload = r.json()
+        if payload.get("error"):
+            print(f"[RAPIDAPI-{tipo.upper()}] erro API: {payload['error']}")
+            return []
+        # A API retorna "users" independente do tipo pedido
+        usuarios = payload.get("users", payload.get(tipo, []))
+        lista = [
+            {
+                "username": u.get("username", ""),
+                "full_name": u.get("full_name", u.get("name", "")),
+            }
+            for u in usuarios
+        ]
+        print(f"[RAPIDAPI-{tipo.upper()}] @{username} → {len(lista)} usuarios")
+        return lista
+    except Exception as e:
+        print(f"[RAPIDAPI-{tipo.upper()}] erro: {e}")
+    return []
+
 # --- Rotação de User-Agent ---------------------------------------------------
 
 _USER_AGENTS = [
@@ -198,6 +293,7 @@ def _fetch_profile_via_api(username):
                     "external_url": user.get("external_url"),
                     "hd_profile_pic": user.get("profile_pic_url_hd"),
                     "_raw_media": user.get("edge_owner_to_timeline_media", {}),
+                    "pk": user.get("id"),
                 }
     except Exception as e:
         print(f"[IG-API] erro: {e}")
@@ -548,7 +644,7 @@ def salvar_sessions(entradas):
                 "ds_user_id": (entrada.get("ds_user_id") or "").strip() or _ds_user_id_do_sessionid(sessionid),
             }
         label = (entrada.get("label") or f"sessao{i + 1}").strip()
-        sessoes.append({"label": label, "cookies": cookies})
+        sessoes.append({"label": label, "cookies": cookies, "has_error": False})
     with open(SESSIONS_FILE, "w", encoding="utf-8") as f:
         json.dump({"sessions": sessoes}, f, ensure_ascii=False, indent=2)
     return len(sessoes)
@@ -747,6 +843,33 @@ class InstagramHandler(BaseHTTPRequestHandler):
                     _invalidar_sessao()
                 except Exception as e:
                     print(f"instagrapi posts error: {e}")
+            # Fallback V1: usa pk da API privada para pular lookup público bloqueado
+            if not posts and LOGIN_OK:
+                try:
+                    api_profile = _fetch_profile_via_api(username)
+                    pk = api_profile.get("pk") if api_profile else None
+                    if pk:
+                        medias = cl.user_medias(int(pk), amount=amount)
+                        for m in medias:
+                            posts.append({
+                                "id": str(m.pk),
+                                "display_url": str(m.thumbnail_url) if m.thumbnail_url else None,
+                                "caption": (m.caption_text or "")[:200],
+                                "likes": m.like_count or 0,
+                                "comments": m.comment_count or 0,
+                                "timestamp": str(m.taken_at),
+                                "is_video": m.media_type == 2,
+                                "video_url": str(m.video_url) if m.media_type == 2 and m.video_url else None,
+                            })
+                        print(f"[POSTS-V1] @{username} → {len(posts)} posts via pk={pk}")
+                except (LoginRequired, ClientLoginRequired):
+                    _invalidar_sessao()
+                except Exception as e:
+                    print(f"posts fallback V1 error: {e}")
+            # Fallback V2: RapidAPI Stable Scraper
+            if not posts:
+                posts = _fetch_posts_rapidapi(username, amount)
+            # Fallback V3: HTML/GraphQL público (como hoje)
             if not posts:
                 posts = fetch_posts_public(username, amount)
             self.send_json({"posts": posts, "count": len(posts)})
@@ -767,38 +890,48 @@ class InstagramHandler(BaseHTTPRequestHandler):
                 _handle_cl_exception(e, self)
         
         elif parsed.path == "/followers":
-            if not LOGIN_OK:
-                self.send_json(_erro_auth(), 401)
-                return
             username = params.get("username", [""])[0]
             amount = int(params.get("amount", ["200"])[0])
             if not username:
                 self.send_json({"error": "username required"}, 400)
                 return
-            try:
-                user = chamar_autenticado(lambda: cl.user_info_by_username(username))
-                followers = chamar_autenticado(lambda: cl.user_followers(user.pk, amount=amount))
-                data = [{"username": f.username, "full_name": f.full_name} for f in followers.values()]
-                self.send_json({"followers": data, "count": len(data)})
-            except Exception as e:
-                _handle_cl_exception(e, self)
-        
+            # 1ª opção: RapidAPI Stable Scraper (mais dados, sem depender de sessão)
+            data = _fetch_lista_rapidapi(username, "followers", amount)
+            # 2ª opção: instagrapi private API
+            if not data and LOGIN_OK:
+                try:
+                    user = chamar_autenticado(lambda: cl.user_info_by_username(username))
+                    followers = chamar_autenticado(lambda: cl.user_followers(user.pk, amount=amount))
+                    data = [{"username": f.username, "full_name": f.full_name} for f in followers.values()]
+                except Exception as e:
+                    _handle_cl_exception(e, self)
+                    return
+            if not data and not LOGIN_OK:
+                self.send_json(_erro_auth(), 401)
+                return
+            self.send_json({"followers": data, "count": len(data)})
+
         elif parsed.path == "/following":
-            if not LOGIN_OK:
-                self.send_json(_erro_auth(), 401)
-                return
             username = params.get("username", [""])[0]
             amount = int(params.get("amount", ["200"])[0])
             if not username:
                 self.send_json({"error": "username required"}, 400)
                 return
-            try:
-                user = chamar_autenticado(lambda: cl.user_info_by_username(username))
-                following = chamar_autenticado(lambda: cl.user_following(user.pk, amount=amount))
-                data = [{"username": f.username, "full_name": f.full_name} for f in following.values()]
-                self.send_json({"following": data, "count": len(data)})
-            except Exception as e:
-                _handle_cl_exception(e, self)
+            # 1ª opção: RapidAPI Stable Scraper
+            data = _fetch_lista_rapidapi(username, "following", amount)
+            # 2ª opção: instagrapi private API
+            if not data and LOGIN_OK:
+                try:
+                    user = chamar_autenticado(lambda: cl.user_info_by_username(username))
+                    following = chamar_autenticado(lambda: cl.user_following(user.pk, amount=amount))
+                    data = [{"username": f.username, "full_name": f.full_name} for f in following.values()]
+                except Exception as e:
+                    _handle_cl_exception(e, self)
+                    return
+            if not data and not LOGIN_OK:
+                self.send_json(_erro_auth(), 401)
+                return
+            self.send_json({"following": data, "count": len(data)})
         
         elif parsed.path == "/comments":
             if not LOGIN_OK:
