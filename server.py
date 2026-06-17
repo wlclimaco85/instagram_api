@@ -164,41 +164,84 @@ def _fetch_posts_rapidapi(username, amount=12):
     return []
 
 
-def _fetch_lista_rapidapi(username, tipo, amount=200):
-    """Busca followers ou following via RapidAPI Stable Scraper.
-    tipo='followers'|'following'. Retorna lista de {username, full_name} ou [] em falha.
+def _fetch_lista_rapidapi(username, tipo, amount=5000):
+    """Busca followers ou following via RapidAPI com paginação automática.
+    Continua buscando páginas enquanto houver pagination_token ou até atingir amount.
     """
     if not RAPIDAPI_KEY:
         return []
-    try:
-        r = http_requests.post(
-            f"https://{RAPIDAPI_HOST_STABLE}/get_ig_user_followers_v2.php",
-            headers=_rapidapi_headers(),
-            data={"username_or_url": username, "data": tipo, "amount": amount, "pagination_token": ""},
-            timeout=35,
-            verify=False,
-        )
-        if r.status_code != 200:
-            print(f"[RAPIDAPI-{tipo.upper()}] HTTP {r.status_code} para @{username}")
-            return []
-        payload = r.json()
-        if payload.get("error"):
-            print(f"[RAPIDAPI-{tipo.upper()}] erro API: {payload['error']}")
-            return []
-        # A API retorna "users" independente do tipo pedido
-        usuarios = payload.get("users", payload.get(tipo, []))
-        lista = [
-            {
-                "username": u.get("username", ""),
-                "full_name": u.get("full_name", u.get("name", "")),
-            }
-            for u in usuarios
-        ]
-        print(f"[RAPIDAPI-{tipo.upper()}] @{username} → {len(lista)} usuarios")
-        return lista
-    except Exception as e:
-        print(f"[RAPIDAPI-{tipo.upper()}] erro: {e}")
-    return []
+
+    todos = []
+    pagination_token = ""
+    pagina = 0
+
+    while len(todos) < amount:
+        pagina += 1
+        por_pagina = min(100, amount - len(todos))
+        try:
+            r = http_requests.post(
+                f"https://{RAPIDAPI_HOST_STABLE}/get_ig_user_followers_v2.php",
+                headers=_rapidapi_headers(),
+                data={
+                    "username_or_url": username,
+                    "data": tipo,
+                    "amount": por_pagina,
+                    "pagination_token": pagination_token,
+                },
+                timeout=35,
+                verify=False,
+            )
+            if r.status_code != 200:
+                print(f"[RAPIDAPI-{tipo.upper()}] pag {pagina}: HTTP {r.status_code}")
+                break
+            payload = r.json()
+            if payload.get("error"):
+                print(f"[RAPIDAPI-{tipo.upper()}] pag {pagina}: erro = {payload['error']}")
+                break
+
+            # Log das chaves de resposta para diagnosticar campo de paginação
+            if pagina == 1:
+                print(f"[RAPIDAPI-{tipo.upper()}] @{username} chaves do payload: {list(payload.keys())}")
+
+            usuarios = payload.get("users", payload.get(tipo, []))
+            if not usuarios:
+                print(f"[RAPIDAPI-{tipo.upper()}] @{username} pag {pagina}: lista vazia — fim da paginacao")
+                break
+
+            # Deduplicação entre páginas
+            vistos = {u["username"] for u in todos}
+            lote = [
+                {
+                    "username": u.get("username", ""),
+                    "full_name": u.get("full_name", u.get("name", "")),
+                }
+                for u in usuarios
+                if u.get("username") and u.get("username") not in vistos
+            ]
+            todos.extend(lote)
+            print(f"[RAPIDAPI-{tipo.upper()}] @{username} pag {pagina}: +{len(lote)} unicos ({len(todos)} total)")
+
+            # Verifica todos os campos de paginação conhecidos
+            pagination_token = (
+                payload.get("pagination_token") or
+                payload.get("next_max_id") or
+                payload.get("next_page_token") or
+                payload.get("next_cursor") or
+                payload.get("end_cursor") or
+                (payload.get("page_info") or {}).get("end_cursor") or
+                (payload.get("page_info") or {}).get("next_max_id") or
+                ""
+            )
+            print(f"[RAPIDAPI-{tipo.upper()}] @{username} pag {pagina}: token = {repr(pagination_token[:30]) if pagination_token else 'NENHUM'}")
+            if not pagination_token:
+                print(f"[RAPIDAPI-{tipo.upper()}] @{username}: sem mais paginas ({len(todos)} total)")
+                break
+
+        except Exception as e:
+            print(f"[RAPIDAPI-{tipo.upper()}] pag {pagina}: erro = {e}")
+            break
+
+    return todos
 
 # --- Rotação de User-Agent ---------------------------------------------------
 
