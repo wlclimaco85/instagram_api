@@ -948,6 +948,80 @@ class InstagramHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 _handle_cl_exception(e, self)
 
+        elif parsed.path == "/post_likers":
+            post_code = params.get("post_code", [""])[0]
+            if not post_code:
+                self.send_json({"error": "post_code required"}, 400)
+                return
+            if not RAPIDAPI_KEY:
+                self.send_json({"error": "rapidapi_key not configured"}, 400)
+                return
+            try:
+                r = http_requests.get(
+                    f"https://{RAPIDAPI_HOST_STABLE}/get_post_likers.php",
+                    headers=_rapidapi_headers(),
+                    params={"post_code": post_code},
+                    timeout=25,
+                    verify=False,
+                )
+                if r.status_code != 200:
+                    print(f"[RAPIDAPI-LIKERS] HTTP {r.status_code} para post_code={post_code}")
+                    self.send_json({"likers": [], "count": 0})
+                    return
+                payload = r.json()
+                # A API retorna lista direta de usuários
+                lista = payload if isinstance(payload, list) else payload.get("likers", [])
+                likers = [
+                    {
+                        "username": u.get("username", ""),
+                        "full_name": u.get("full_name", ""),
+                    }
+                    for u in lista
+                ]
+                print(f"[RAPIDAPI-LIKERS] post_code={post_code} → {len(likers)} likers")
+                self.send_json({"likers": likers, "count": len(likers)})
+            except Exception as e:
+                print(f"[RAPIDAPI-LIKERS] erro: {e}")
+                self.send_json({"error": str(e)}, 500)
+
+        elif parsed.path == "/post_comments":
+            media_code = params.get("media_code", [""])[0]
+            sort_order = params.get("sort_order", ["popular"])[0]
+            if not media_code:
+                self.send_json({"error": "media_code required"}, 400)
+                return
+            if not RAPIDAPI_KEY:
+                self.send_json({"error": "rapidapi_key not configured"}, 400)
+                return
+            try:
+                r = http_requests.get(
+                    f"https://{RAPIDAPI_HOST_STABLE}/get_post_comments.php",
+                    headers=_rapidapi_headers(),
+                    params={"media_code": media_code, "sort_order": sort_order},
+                    timeout=25,
+                    verify=False,
+                )
+                if r.status_code != 200:
+                    print(f"[RAPIDAPI-COMMENTS] HTTP {r.status_code} para media_code={media_code}")
+                    self.send_json({"comments": [], "count": 0})
+                    return
+                payload = r.json()
+                comentarios_brutos = payload.get("comments", [])
+                comentarios = [
+                    {
+                        "username": c.get("owner", {}).get("username", ""),
+                        "text": c.get("text", ""),
+                        "created_at": c.get("created_at", 0),
+                    }
+                    for c in comentarios_brutos
+                ]
+                total = payload.get("count", len(comentarios))
+                print(f"[RAPIDAPI-COMMENTS] media_code={media_code} → {len(comentarios)} comentários")
+                self.send_json({"comments": comentarios, "count": total})
+            except Exception as e:
+                print(f"[RAPIDAPI-COMMENTS] erro: {e}")
+                self.send_json({"error": str(e)}, 500)
+
         elif parsed.path == "/track":
             username = params.get("username", [""])[0]
             if not username:
@@ -1226,7 +1300,7 @@ def main():
         return
 
     print(f"Instagram API rodando em http://0.0.0.0:{port}")
-    print("Endpoints: /profile, /posts, /likers, /followers, /following, /comments, /snapshot, /timeline, /track, /sessions")
+    print("Endpoints: /profile, /posts, /likers, /followers, /following, /comments, /post_likers, /post_comments, /snapshot, /timeline, /track, /sessions")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
