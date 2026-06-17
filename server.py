@@ -177,7 +177,7 @@ def _fetch_lista_rapidapi(username, tipo, amount=5000):
 
     while len(todos) < amount:
         pagina += 1
-        por_pagina = min(100, amount - len(todos))
+        por_pagina = min(200, amount - len(todos))
         try:
             r = http_requests.post(
                 f"https://{RAPIDAPI_HOST_STABLE}/get_ig_user_followers_v2.php",
