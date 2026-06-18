@@ -182,6 +182,72 @@ def _fetch_posts_rapidapi(username, amount=12):
     return []
 
 
+# Numero de tentativas por requisicao a RapidAPI quando o erro e TRANSITORIO.
+_MAX_RETRY_RAPIDAPI = 3
+
+
+def _post_rapidapi_com_retry(chave, username, tipo, tamanho, pagination_token, label, pagina):
+    """POST a RapidAPI com retry/backoff exponencial para erros TRANSITORIOS do
+    provedor ('Please try again later', HTTP 5xx). Erros PERMANENTES (429 rate
+    limit, cota esgotada, bloqueio) NAO sao retentados — desiste logo da chave
+    para o fallback passar para a proxima. Retorna o payload em caso de sucesso
+    ou None se falhou de vez.
+    """
+    for tentativa in range(1, _MAX_RETRY_RAPIDAPI + 1):
+        try:
+            r = http_requests.post(
+                f"https://{RAPIDAPI_HOST_STABLE}/get_ig_user_followers_v2.php",
+                headers=_rapidapi_headers(chave),
+                data={
+                    "username_or_url": username,
+                    "data": tipo,
+                    "amount": tamanho,
+                    "pagination_token": pagination_token,
+                },
+                timeout=35,
+                verify=False,
+            )
+            try:
+                payload = r.json()
+            except Exception:
+                payload = None
+            erro_msg = ""
+            if isinstance(payload, dict) and payload.get("error"):
+                erro_msg = str(payload.get("error"))
+
+            # Sucesso real
+            if r.status_code == 200 and not erro_msg:
+                return payload
+
+            # Transitorio: 5xx do gateway ou mensagem de "tente de novo" do provedor
+            msg = erro_msg.lower()
+            transitorio = (
+                r.status_code in (500, 502, 503, 504)
+                or "try again" in msg
+                or "temporarily" in msg
+            )
+            if transitorio and tentativa < _MAX_RETRY_RAPIDAPI:
+                espera = 2 ** tentativa  # 2s, 4s
+                print(f"{label} pag {pagina}: transitorio (HTTP {r.status_code} / {erro_msg or '-'}) "
+                      f"— tentativa {tentativa}/{_MAX_RETRY_RAPIDAPI}, aguardando {espera}s")
+                time.sleep(espera)
+                continue
+
+            # Permanente (429/cota/bloqueio) ou esgotou as tentativas
+            print(f"{label} pag {pagina}: HTTP {r.status_code} erro={erro_msg or '-'} "
+                  f"— desistindo desta chave")
+            return None
+        except Exception as e:
+            if tentativa < _MAX_RETRY_RAPIDAPI:
+                espera = 2 ** tentativa
+                print(f"{label} pag {pagina}: excecao {e} — tentativa {tentativa}/{_MAX_RETRY_RAPIDAPI}, aguardando {espera}s")
+                time.sleep(espera)
+                continue
+            print(f"{label} pag {pagina}: excecao final = {e}")
+            return None
+    return None
+
+
 def _fetch_com_chave(username, tipo, amount, chave):
     """Pagina os resultados disponiveis para uma chave em um unico passe.
 
@@ -198,52 +264,33 @@ def _fetch_com_chave(username, tipo, amount, chave):
     while len(todos) < amount:
         pagina += 1
         tamanho = min(200, amount - len(todos))
-        try:
-            r = http_requests.post(
-                f"https://{RAPIDAPI_HOST_STABLE}/get_ig_user_followers_v2.php",
-                headers=_rapidapi_headers(chave),
-                data={
-                    "username_or_url": username,
-                    "data": tipo,
-                    "amount": tamanho,
-                    "pagination_token": pagination_token,
-                },
-                timeout=35,
-                verify=False,
-            )
-            if r.status_code != 200:
-                print(f"{label} pag {pagina}: HTTP {r.status_code} — chave esgotada/bloqueada")
-                break
-            payload = r.json()
-            if payload.get("error"):
-                print(f"{label} pag {pagina}: erro API = {payload['error']} — chave esgotada/bloqueada")
-                break
-            if pagina == 1:
-                print(f"{label} @{username} chaves do payload: {list(payload.keys())}")
-            usuarios = payload.get("users", payload.get(tipo, []))
-            if not usuarios:
-                print(f"{label} @{username} pag {pagina}: lista vazia — fim da paginacao")
-                break
-            lote = [
-                {"username": u.get("username", ""), "full_name": u.get("full_name", u.get("name", ""))}
-                for u in usuarios
-                if u.get("username") and u.get("username") not in vistos
-            ]
-            vistos.update(u["username"] for u in lote)
-            todos.extend(lote)
-            print(f"{label} @{username} pag {pagina}: +{len(lote)} novos ({len(todos)} total)")
-            pagination_token = (
-                payload.get("pagination_token") or payload.get("next_max_id") or
-                payload.get("next_page_token") or payload.get("next_cursor") or
-                payload.get("end_cursor") or
-                (payload.get("page_info") or {}).get("end_cursor") or
-                (payload.get("page_info") or {}).get("next_max_id") or ""
-            )
-            if not pagination_token:
-                print(f"{label} @{username}: sem mais paginas ({len(todos)} total)")
-                break
-        except Exception as e:
-            print(f"{label} pag {pagina}: excecao = {e}")
+        payload = _post_rapidapi_com_retry(
+            chave, username, tipo, tamanho, pagination_token, label, pagina)
+        if not payload:
+            break
+        if pagina == 1:
+            print(f"{label} @{username} chaves do payload: {list(payload.keys())}")
+        usuarios = payload.get("users", payload.get(tipo, []))
+        if not usuarios:
+            print(f"{label} @{username} pag {pagina}: lista vazia — fim da paginacao")
+            break
+        lote = [
+            {"username": u.get("username", ""), "full_name": u.get("full_name", u.get("name", ""))}
+            for u in usuarios
+            if u.get("username") and u.get("username") not in vistos
+        ]
+        vistos.update(u["username"] for u in lote)
+        todos.extend(lote)
+        print(f"{label} @{username} pag {pagina}: +{len(lote)} novos ({len(todos)} total)")
+        pagination_token = (
+            payload.get("pagination_token") or payload.get("next_max_id") or
+            payload.get("next_page_token") or payload.get("next_cursor") or
+            payload.get("end_cursor") or
+            (payload.get("page_info") or {}).get("end_cursor") or
+            (payload.get("page_info") or {}).get("next_max_id") or ""
+        )
+        if not pagination_token:
+            print(f"{label} @{username}: sem mais paginas ({len(todos)} total)")
             break
     return todos
 
