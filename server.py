@@ -176,78 +176,68 @@ def _fetch_posts_rapidapi(username, amount=12):
 
 
 def _fetch_com_chave(username, tipo, amount, chave):
-    """Pagina com múltiplos tamanhos de página para maximizar cobertura por chave.
-    Cada passe recomeça do início com um tamanho menor; usuários já vistos são ignorados.
+    """Pagina os resultados disponiveis para uma chave em um unico passe.
+
+    O multi-passe (200/100/50) foi removido: a API retorna sempre a mesma
+    sequencia de usuarios, entao repaginar com tamanhos diferentes apenas
+    re-busca os mesmos (dedup zera o ganho) e gasta ~3x mais requests,
+    queimando a cota da chave sem aumentar a cobertura.
     """
-    vistos: set = set()
     todos = []
+    vistos: set = set()
+    pagination_token = ""
+    pagina = 0
     label = f"[RAPIDAPI-{tipo.upper()}][k={chave[-6:]}]"
-
-    for por_pagina in [200, 100, 50]:
-        if len(todos) >= amount:
-            break
-        pagination_token = ""
-        pagina = 0
-        novos_neste_passe = 0
-        print(f"{label} @{username}: passe por_pagina={por_pagina}")
-
-        while len(todos) < amount:
-            pagina += 1
-            tamanho = min(por_pagina, amount - len(todos))
-            try:
-                r = http_requests.post(
-                    f"https://{RAPIDAPI_HOST_STABLE}/get_ig_user_followers_v2.php",
-                    headers=_rapidapi_headers(chave),
-                    data={
-                        "username_or_url": username,
-                        "data": tipo,
-                        "amount": tamanho,
-                        "pagination_token": pagination_token,
-                    },
-                    timeout=35,
-                    verify=False,
-                )
-                if r.status_code != 200:
-                    print(f"{label} pag {pagina}: HTTP {r.status_code} — chave esgotada/bloqueada")
-                    return todos
-                payload = r.json()
-                if payload.get("error"):
-                    print(f"{label} pag {pagina}: erro API = {payload['error']} — chave esgotada/bloqueada")
-                    return todos
-                if pagina == 1:
-                    print(f"{label} @{username} chaves do payload: {list(payload.keys())}")
-                usuarios = payload.get("users", payload.get(tipo, []))
-                if not usuarios:
-                    print(f"{label} @{username} pag {pagina}: lista vazia — fim do passe")
-                    break
-                lote = [
-                    {"username": u.get("username", ""), "full_name": u.get("full_name", u.get("name", ""))}
-                    for u in usuarios
-                    if u.get("username") and u.get("username") not in vistos
-                ]
-                vistos.update(u["username"] for u in lote)
-                todos.extend(lote)
-                novos_neste_passe += len(lote)
-                print(f"{label} @{username} pag {pagina}: +{len(lote)} novos ({len(todos)} total)")
-                pagination_token = (
-                    payload.get("pagination_token") or payload.get("next_max_id") or
-                    payload.get("next_page_token") or payload.get("next_cursor") or
-                    payload.get("end_cursor") or
-                    (payload.get("page_info") or {}).get("end_cursor") or
-                    (payload.get("page_info") or {}).get("next_max_id") or ""
-                )
-                if not pagination_token:
-                    print(f"{label} @{username}: sem mais paginas neste passe ({len(todos)} total)")
-                    break
-            except Exception as e:
-                print(f"{label} pag {pagina}: excecao = {e}")
+    while len(todos) < amount:
+        pagina += 1
+        tamanho = min(200, amount - len(todos))
+        try:
+            r = http_requests.post(
+                f"https://{RAPIDAPI_HOST_STABLE}/get_ig_user_followers_v2.php",
+                headers=_rapidapi_headers(chave),
+                data={
+                    "username_or_url": username,
+                    "data": tipo,
+                    "amount": tamanho,
+                    "pagination_token": pagination_token,
+                },
+                timeout=35,
+                verify=False,
+            )
+            if r.status_code != 200:
+                print(f"{label} pag {pagina}: HTTP {r.status_code} — chave esgotada/bloqueada")
                 break
-
-        print(f"{label} @{username}: passe por_pagina={por_pagina} trouxe {novos_neste_passe} novos")
-        if novos_neste_passe == 0:
-            print(f"{label}: nenhum novo neste passe — chave esgotada, parando")
+            payload = r.json()
+            if payload.get("error"):
+                print(f"{label} pag {pagina}: erro API = {payload['error']} — chave esgotada/bloqueada")
+                break
+            if pagina == 1:
+                print(f"{label} @{username} chaves do payload: {list(payload.keys())}")
+            usuarios = payload.get("users", payload.get(tipo, []))
+            if not usuarios:
+                print(f"{label} @{username} pag {pagina}: lista vazia — fim da paginacao")
+                break
+            lote = [
+                {"username": u.get("username", ""), "full_name": u.get("full_name", u.get("name", ""))}
+                for u in usuarios
+                if u.get("username") and u.get("username") not in vistos
+            ]
+            vistos.update(u["username"] for u in lote)
+            todos.extend(lote)
+            print(f"{label} @{username} pag {pagina}: +{len(lote)} novos ({len(todos)} total)")
+            pagination_token = (
+                payload.get("pagination_token") or payload.get("next_max_id") or
+                payload.get("next_page_token") or payload.get("next_cursor") or
+                payload.get("end_cursor") or
+                (payload.get("page_info") or {}).get("end_cursor") or
+                (payload.get("page_info") or {}).get("next_max_id") or ""
+            )
+            if not pagination_token:
+                print(f"{label} @{username}: sem mais paginas ({len(todos)} total)")
+                break
+        except Exception as e:
+            print(f"{label} pag {pagina}: excecao = {e}")
             break
-
     return todos
 
 
