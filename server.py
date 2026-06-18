@@ -1020,8 +1020,9 @@ class InstagramHandler(BaseHTTPRequestHandler):
             if not username:
                 self.send_json({"error": "username required"}, 400)
                 return
-            # 1ª opção: RapidAPI Stable Scraper (mais dados, sem depender de sessão)
             chaves_req = [k.strip() for k in params.get("keys", [""])[0].split(",") if k.strip()]
+            print(f"[/followers] @{username} amount={amount} chaves={len(chaves_req)}")
+            # 1ª opção: RapidAPI Stable Scraper (mais dados, sem depender de sessão)
             data = _fetch_lista_rapidapi(username, "followers", amount, chaves_override=chaves_req)
             # 2ª opção: instagrapi private API
             if not data and LOGIN_OK:
@@ -1035,6 +1036,7 @@ class InstagramHandler(BaseHTTPRequestHandler):
             if not data and not LOGIN_OK:
                 self.send_json(_erro_auth(), 401)
                 return
+            print(f"[/followers] @{username} → {len(data)} registros retornados")
             self.send_json({"followers": data, "count": len(data)})
 
         elif parsed.path == "/following":
@@ -1043,8 +1045,9 @@ class InstagramHandler(BaseHTTPRequestHandler):
             if not username:
                 self.send_json({"error": "username required"}, 400)
                 return
-            # 1ª opção: RapidAPI Stable Scraper
             chaves_req = [k.strip() for k in params.get("keys", [""])[0].split(",") if k.strip()]
+            print(f"[/following] @{username} amount={amount} chaves={len(chaves_req)}")
+            # 1ª opção: RapidAPI Stable Scraper
             data = _fetch_lista_rapidapi(username, "following", amount, chaves_override=chaves_req)
             # 2ª opção: instagrapi private API
             if not data and LOGIN_OK:
@@ -1058,6 +1061,7 @@ class InstagramHandler(BaseHTTPRequestHandler):
             if not data and not LOGIN_OK:
                 self.send_json(_erro_auth(), 401)
                 return
+            print(f"[/following] @{username} → {len(data)} registros retornados")
             self.send_json({"following": data, "count": len(data)})
 
         elif parsed.path == "/rapidapi_status":
