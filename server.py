@@ -248,20 +248,26 @@ def _fetch_com_chave(username, tipo, amount, chave):
     return todos
 
 
-def _fetch_lista_rapidapi(username, tipo, amount=5000):
-    """Busca followers/following usando todas as chaves configuradas.
-    Cada chave pagina independentemente; resultados são mesclados e deduplados.
-    Se uma chave falhar, a próxima assume automaticamente.
+def _fetch_lista_rapidapi(username, tipo, amount=5000, chaves_override=None):
+    """Busca followers/following usando as chaves configuradas.
+
+    chaves_override: lista de chaves vinda do popup de configuracao (via Spring).
+    Tem prioridade sobre as chaves do .env; o .env vira fallback quando o popup
+    nao envia nenhuma chave. Cada chave pagina independentemente; resultados sao
+    mesclados/deduplados e, se uma falhar, a proxima assume.
     """
-    if not _RAPIDAPI_KEYS:
-        print(f"[RAPIDAPI] Nenhuma chave configurada (RAPIDAPI_KEY/RAPIDAPI_KEY_2/RAPIDAPI_KEY_3)")
+    chaves = [k for k in (chaves_override or []) if k] or _RAPIDAPI_KEYS
+    if not chaves:
+        print(f"[RAPIDAPI] Nenhuma chave configurada (popup vazio e .env vazio)")
         return []
+    origem = "popup" if chaves_override else ".env"
+    print(f"[RAPIDAPI-{tipo.upper()}] @{username}: usando {len(chaves)} chave(s) (origem: {origem})")
 
     todos = []
     vistos: set = set()
 
-    for idx, chave in enumerate(_RAPIDAPI_KEYS, 1):
-        print(f"[RAPIDAPI-{tipo.upper()}] @{username}: iniciando chave {idx}/{len(_RAPIDAPI_KEYS)} (sufixo ...{chave[-6:]})")
+    for idx, chave in enumerate(chaves, 1):
+        print(f"[RAPIDAPI-{tipo.upper()}] @{username}: iniciando chave {idx}/{len(chaves)} (sufixo ...{chave[-6:]})")
         parcial = _fetch_com_chave(username, tipo, amount, chave)
         novos = [u for u in parcial if u["username"] not in vistos]
         vistos.update(u["username"] for u in novos)
@@ -968,7 +974,8 @@ class InstagramHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": "username required"}, 400)
                 return
             # 1ª opção: RapidAPI Stable Scraper (mais dados, sem depender de sessão)
-            data = _fetch_lista_rapidapi(username, "followers", amount)
+            chaves_req = [k.strip() for k in params.get("keys", [""])[0].split(",") if k.strip()]
+            data = _fetch_lista_rapidapi(username, "followers", amount, chaves_override=chaves_req)
             # 2ª opção: instagrapi private API
             if not data and LOGIN_OK:
                 try:
@@ -990,7 +997,8 @@ class InstagramHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": "username required"}, 400)
                 return
             # 1ª opção: RapidAPI Stable Scraper
-            data = _fetch_lista_rapidapi(username, "following", amount)
+            chaves_req = [k.strip() for k in params.get("keys", [""])[0].split(",") if k.strip()]
+            data = _fetch_lista_rapidapi(username, "following", amount, chaves_override=chaves_req)
             # 2ª opção: instagrapi private API
             if not data and LOGIN_OK:
                 try:
