@@ -109,14 +109,21 @@ _PROXIES = {"https": PROXY_URL, "http": PROXY_URL} if PROXY_URL else None
 
 RAPIDAPI_HOST_STABLE = "instagram-scraper-stable-api.p.rapidapi.com"
 
-# Carrega todas as chaves configuradas; ignora vazias
-_RAPIDAPI_KEYS = [
-    k for k in [
-        os.environ.get("RAPIDAPI_KEY", "").strip(),
-        os.environ.get("RAPIDAPI_KEY_2", "").strip(),
-        os.environ.get("RAPIDAPI_KEY_3", "").strip(),
-    ] if k
-]
+# Carrega dinamicamente todas as chaves: RAPIDAPI_KEY, RAPIDAPI_KEY_2 .. _10.
+# Permite adicionar quantas chaves quiser (4a, 5a...) sem alterar o codigo.
+def _carregar_chaves_rapidapi():
+    chaves = []
+    primeira = os.environ.get("RAPIDAPI_KEY", "").strip()
+    if primeira:
+        chaves.append(primeira)
+    for i in range(2, 11):
+        valor = os.environ.get(f"RAPIDAPI_KEY_{i}", "").strip()
+        if valor:
+            chaves.append(valor)
+    return chaves
+
+
+_RAPIDAPI_KEYS = _carregar_chaves_rapidapi()
 # Compatibilidade: mantém RAPIDAPI_KEY apontando para a primeira disponível
 RAPIDAPI_KEY = _RAPIDAPI_KEYS[0] if _RAPIDAPI_KEYS else ""
 
@@ -997,7 +1004,49 @@ class InstagramHandler(BaseHTTPRequestHandler):
                 self.send_json(_erro_auth(), 401)
                 return
             self.send_json({"following": data, "count": len(data)})
-        
+
+        elif parsed.path == "/rapidapi_status":
+            # Diagnostico: testa cada chave isoladamente (1 request por chave)
+            # e reporta qual responde e qual esta esgotada/bloqueada.
+            alvo = params.get("username", ["hednaidealves"])[0]
+            resultado = []
+            for idx, chave in enumerate(_RAPIDAPI_KEYS, 1):
+                info = {"indice": idx, "sufixo": chave[-6:]}
+                try:
+                    r = http_requests.post(
+                        f"https://{RAPIDAPI_HOST_STABLE}/get_ig_user_followers_v2.php",
+                        headers=_rapidapi_headers(chave),
+                        data={
+                            "username_or_url": alvo,
+                            "data": "followers",
+                            "amount": 12,
+                            "pagination_token": "",
+                        },
+                        timeout=35,
+                        verify=False,
+                    )
+                    info["http"] = r.status_code
+                    try:
+                        payload = r.json()
+                    except Exception:
+                        payload = None
+                    if r.status_code != 200:
+                        info["status"] = "ERRO_HTTP"
+                        info["detalhe"] = (r.text or "")[:200]
+                    elif isinstance(payload, dict) and payload.get("error"):
+                        info["status"] = "ERRO_API"
+                        info["detalhe"] = str(payload.get("error"))[:200]
+                    else:
+                        usuarios = (payload.get("users", payload.get("followers", []))
+                                    if isinstance(payload, dict) else [])
+                        info["status"] = "OK" if usuarios else "VAZIO"
+                        info["retornou"] = len(usuarios)
+                except Exception as e:
+                    info["status"] = "EXCECAO"
+                    info["detalhe"] = str(e)[:200]
+                resultado.append(info)
+            self.send_json({"total_chaves": len(_RAPIDAPI_KEYS), "chaves": resultado})
+
         elif parsed.path == "/comments":
             if not LOGIN_OK:
                 self.send_json(_erro_auth(), 401)
