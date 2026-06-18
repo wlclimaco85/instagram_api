@@ -107,14 +107,25 @@ _PROXIES = {"https": PROXY_URL, "http": PROXY_URL} if PROXY_URL else None
 
 # --- RapidAPI (Instagram Scraper Stable) ------------------------------------
 
-RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY", "").strip()
 RAPIDAPI_HOST_STABLE = "instagram-scraper-stable-api.p.rapidapi.com"
 
+# Carrega todas as chaves configuradas; ignora vazias
+_RAPIDAPI_KEYS = [
+    k for k in [
+        os.environ.get("RAPIDAPI_KEY", "").strip(),
+        os.environ.get("RAPIDAPI_KEY_2", "").strip(),
+        os.environ.get("RAPIDAPI_KEY_3", "").strip(),
+    ] if k
+]
+# Compatibilidade: mantém RAPIDAPI_KEY apontando para a primeira disponível
+RAPIDAPI_KEY = _RAPIDAPI_KEYS[0] if _RAPIDAPI_KEYS else ""
 
-def _rapidapi_headers():
+
+def _rapidapi_headers(key=None):
+    chave = key or RAPIDAPI_KEY
     return {
         "Content-Type": "application/x-www-form-urlencoded",
-        "x-rapidapi-key": RAPIDAPI_KEY,
+        "x-rapidapi-key": chave,
         "x-rapidapi-host": RAPIDAPI_HOST_STABLE,
     }
 
@@ -164,24 +175,19 @@ def _fetch_posts_rapidapi(username, amount=12):
     return []
 
 
-def _fetch_lista_rapidapi(username, tipo, amount=5000):
-    """Busca followers ou following via RapidAPI com paginação automática.
-    Continua buscando páginas enquanto houver pagination_token ou até atingir amount.
-    """
-    if not RAPIDAPI_KEY:
-        return []
-
+def _fetch_com_chave(username, tipo, amount, chave):
+    """Pagina todos os resultados para uma chave específica. Retorna lista de {username, full_name}."""
     todos = []
     pagination_token = ""
     pagina = 0
-
+    label = f"[RAPIDAPI-{tipo.upper()}][k={chave[-6:]}]"
     while len(todos) < amount:
         pagina += 1
         por_pagina = min(200, amount - len(todos))
         try:
             r = http_requests.post(
                 f"https://{RAPIDAPI_HOST_STABLE}/get_ig_user_followers_v2.php",
-                headers=_rapidapi_headers(),
+                headers=_rapidapi_headers(chave),
                 data={
                     "username_or_url": username,
                     "data": tipo,
@@ -192,53 +198,62 @@ def _fetch_lista_rapidapi(username, tipo, amount=5000):
                 verify=False,
             )
             if r.status_code != 200:
-                print(f"[RAPIDAPI-{tipo.upper()}] pag {pagina}: HTTP {r.status_code}")
+                print(f"{label} pag {pagina}: HTTP {r.status_code} — chave esgotada/bloqueada")
                 break
             payload = r.json()
             if payload.get("error"):
-                print(f"[RAPIDAPI-{tipo.upper()}] pag {pagina}: erro = {payload['error']}")
+                print(f"{label} pag {pagina}: erro API = {payload['error']} — chave esgotada/bloqueada")
                 break
-
-            # Log das chaves de resposta para diagnosticar campo de paginação
             if pagina == 1:
-                print(f"[RAPIDAPI-{tipo.upper()}] @{username} chaves do payload: {list(payload.keys())}")
-
+                print(f"{label} @{username} chaves do payload: {list(payload.keys())}")
             usuarios = payload.get("users", payload.get(tipo, []))
             if not usuarios:
-                print(f"[RAPIDAPI-{tipo.upper()}] @{username} pag {pagina}: lista vazia — fim da paginacao")
+                print(f"{label} @{username} pag {pagina}: lista vazia — fim da paginacao")
                 break
-
-            # Deduplicação entre páginas
             vistos = {u["username"] for u in todos}
             lote = [
-                {
-                    "username": u.get("username", ""),
-                    "full_name": u.get("full_name", u.get("name", "")),
-                }
+                {"username": u.get("username", ""), "full_name": u.get("full_name", u.get("name", ""))}
                 for u in usuarios
                 if u.get("username") and u.get("username") not in vistos
             ]
             todos.extend(lote)
-            print(f"[RAPIDAPI-{tipo.upper()}] @{username} pag {pagina}: +{len(lote)} unicos ({len(todos)} total)")
-
-            # Verifica todos os campos de paginação conhecidos
+            print(f"{label} @{username} pag {pagina}: +{len(lote)} unicos ({len(todos)} total)")
             pagination_token = (
-                payload.get("pagination_token") or
-                payload.get("next_max_id") or
-                payload.get("next_page_token") or
-                payload.get("next_cursor") or
+                payload.get("pagination_token") or payload.get("next_max_id") or
+                payload.get("next_page_token") or payload.get("next_cursor") or
                 payload.get("end_cursor") or
                 (payload.get("page_info") or {}).get("end_cursor") or
-                (payload.get("page_info") or {}).get("next_max_id") or
-                ""
+                (payload.get("page_info") or {}).get("next_max_id") or ""
             )
-            print(f"[RAPIDAPI-{tipo.upper()}] @{username} pag {pagina}: token = {repr(pagination_token[:30]) if pagination_token else 'NENHUM'}")
             if not pagination_token:
-                print(f"[RAPIDAPI-{tipo.upper()}] @{username}: sem mais paginas ({len(todos)} total)")
+                print(f"{label} @{username}: sem mais paginas ({len(todos)} total)")
                 break
-
         except Exception as e:
-            print(f"[RAPIDAPI-{tipo.upper()}] pag {pagina}: erro = {e}")
+            print(f"{label} pag {pagina}: excecao = {e}")
+            break
+    return todos
+
+
+def _fetch_lista_rapidapi(username, tipo, amount=5000):
+    """Busca followers/following usando todas as chaves configuradas.
+    Cada chave pagina independentemente; resultados são mesclados e deduplados.
+    Se uma chave falhar, a próxima assume automaticamente.
+    """
+    if not _RAPIDAPI_KEYS:
+        print(f"[RAPIDAPI] Nenhuma chave configurada (RAPIDAPI_KEY/RAPIDAPI_KEY_2/RAPIDAPI_KEY_3)")
+        return []
+
+    todos = []
+    vistos: set = set()
+
+    for idx, chave in enumerate(_RAPIDAPI_KEYS, 1):
+        print(f"[RAPIDAPI-{tipo.upper()}] @{username}: iniciando chave {idx}/{len(_RAPIDAPI_KEYS)} (sufixo ...{chave[-6:]})")
+        parcial = _fetch_com_chave(username, tipo, amount, chave)
+        novos = [u for u in parcial if u["username"] not in vistos]
+        vistos.update(u["username"] for u in novos)
+        todos.extend(novos)
+        print(f"[RAPIDAPI-{tipo.upper()}] @{username}: chave {idx} contribuiu {len(novos)} novos — total acumulado: {len(todos)}")
+        if len(todos) >= amount:
             break
 
     return todos
