@@ -1,0 +1,2 @@
+# Chaves RapidAPI para testes (uma por linha)
+4d3759af99msh309604713ee3837p1ed098jsn8da8f98ce2ba

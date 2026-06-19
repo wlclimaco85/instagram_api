@@ -1022,19 +1022,9 @@ class InstagramHandler(BaseHTTPRequestHandler):
                 return
             chaves_req = [k.strip() for k in params.get("keys", [""])[0].split(",") if k.strip()]
             print(f"[/followers] @{username} amount={amount} chaves={len(chaves_req)}")
-            # 1ª opção: RapidAPI Stable Scraper (mais dados, sem depender de sessão)
             data = _fetch_lista_rapidapi(username, "followers", amount, chaves_override=chaves_req)
-            # 2ª opção: instagrapi private API
-            if not data and LOGIN_OK:
-                try:
-                    user = chamar_autenticado(lambda: cl.user_info_by_username(username))
-                    followers = chamar_autenticado(lambda: cl.user_followers(user.pk, amount=amount))
-                    data = [{"username": f.username, "full_name": f.full_name} for f in followers.values()]
-                except Exception as e:
-                    _handle_cl_exception(e, self)
-                    return
-            if not data and not LOGIN_OK:
-                self.send_json(_erro_auth(), 401)
+            if not data:
+                self.send_json({"error": "RapidAPI nao retornou dados (rate limit ou chave invalida)"}, 503)
                 return
             print(f"[/followers] @{username} → {len(data)} registros retornados")
             self.send_json({"followers": data, "count": len(data)})
@@ -1047,19 +1037,9 @@ class InstagramHandler(BaseHTTPRequestHandler):
                 return
             chaves_req = [k.strip() for k in params.get("keys", [""])[0].split(",") if k.strip()]
             print(f"[/following] @{username} amount={amount} chaves={len(chaves_req)}")
-            # 1ª opção: RapidAPI Stable Scraper
             data = _fetch_lista_rapidapi(username, "following", amount, chaves_override=chaves_req)
-            # 2ª opção: instagrapi private API
-            if not data and LOGIN_OK:
-                try:
-                    user = chamar_autenticado(lambda: cl.user_info_by_username(username))
-                    following = chamar_autenticado(lambda: cl.user_following(user.pk, amount=amount))
-                    data = [{"username": f.username, "full_name": f.full_name} for f in following.values()]
-                except Exception as e:
-                    _handle_cl_exception(e, self)
-                    return
-            if not data and not LOGIN_OK:
-                self.send_json(_erro_auth(), 401)
+            if not data:
+                self.send_json({"error": "RapidAPI nao retornou dados (rate limit ou chave invalida)"}, 503)
                 return
             print(f"[/following] @{username} → {len(data)} registros retornados")
             self.send_json({"following": data, "count": len(data)})

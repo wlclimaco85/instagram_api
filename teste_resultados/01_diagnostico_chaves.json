@@ -1,0 +1,14 @@
+{
+  "txt_k1": {
+    "status": 200,
+    "erro": "Please try again later. You wont be charged for this request.",
+    "ok": false,
+    "amostra": 0
+  },
+  "env_k1": {
+    "status": 429,
+    "erro": "429 rate limit",
+    "ok": false,
+    "amostra": 0
+  }
+}
