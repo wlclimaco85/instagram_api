@@ -184,7 +184,9 @@ def _fetch_posts_rapidapi(username, amount=12):
 
 
 # Numero de tentativas por requisicao a RapidAPI quando o erro e TRANSITORIO.
-_MAX_RETRY_RAPIDAPI = 3
+# "try again later" (HTTP 200 + mensagem do provedor) precisa de mais paciencia
+# do que 5xx de gateway — o upstream pode estar momentaneamente sobrecarregado.
+_MAX_RETRY_RAPIDAPI = 5
 
 
 def _post_rapidapi_com_retry(chave, username, tipo, tamanho, pagination_token, label, pagina):
@@ -228,7 +230,12 @@ def _post_rapidapi_com_retry(chave, username, tipo, tamanho, pagination_token, l
                 or "temporarily" in msg
             )
             if transitorio and tentativa < _MAX_RETRY_RAPIDAPI:
-                espera = 2 ** tentativa  # 2s, 4s
+                # "try again later" = provedor pago sobrecarregado: espera longa (10s, 20s, 40s, 60s).
+                # 5xx de gateway = servidor caiu/reiniciando: espera curta (2s, 4s, 8s, 16s).
+                if "try again" in msg or "temporarily" in msg:
+                    espera = min(10 * (2 ** (tentativa - 1)), 60)
+                else:
+                    espera = 2 ** tentativa
                 print(f"{label} pag {pagina}: transitorio (HTTP {r.status_code} / {erro_msg or '-'}) "
                       f"— tentativa {tentativa}/{_MAX_RETRY_RAPIDAPI}, aguardando {espera}s")
                 time.sleep(espera)
@@ -315,6 +322,10 @@ def _fetch_lista_rapidapi(username, tipo, amount=5000, chaves_override=None):
     vistos: set = set()
 
     for idx, chave in enumerate(chaves, 1):
+        if idx > 1:
+            # Pausa entre chaves: evita que uma rejeicao rapida da chave anterior
+            # (429/try-again) ainda esteja ativa no upstream quando a proxima chave tenta.
+            time.sleep(5)
         print(f"[RAPIDAPI-{tipo.upper()}] @{username}: iniciando chave {idx}/{len(chaves)} (sufixo ...{chave[-6:]})")
         parcial = _fetch_com_chave(username, tipo, amount, chave)
         novos = [u for u in parcial if u["username"] not in vistos]
