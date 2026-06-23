@@ -200,7 +200,9 @@ def _post_rapidapi_com_retry(chave, username, tipo, tamanho, start_from, label, 
     ao inves do v2 — o v2 exige plano superior e retorna 'try again later' para
     chaves de plano basico mesmo pagas.
     """
-    endpoint = "get_ig_user_followers.php" if tipo == "followers" else "get_ig_user_following.php"
+    # Mesmo endpoint para followers e following — o param data=tipo distingue o tipo.
+    # get_ig_user_following.php nao existe (404 confirmado em teste).
+    endpoint = "get_ig_user_followers.php"
     for tentativa in range(1, _MAX_RETRY_RAPIDAPI + 1):
         try:
             r = http_requests.post(
