@@ -1,4 +1,4 @@
-"""
+﻿"""
 Mini-servidor Instagram API para o App Match.
 Uso: python server.py
 Porta: 8500
@@ -73,6 +73,7 @@ def _novo_client():
 
 cl = _novo_client()
 LOGIN_OK = False
+_PK_CACHE: dict = {}  # username → pk (evita chamar user_id_from_username repetidamente)
 
 # --- TTL Cache simples -------------------------------------------------------
 
@@ -325,6 +326,46 @@ def _fetch_lista_rapidapi(username, tipo, amount=5000, chaves_override=None):
 
     return todos
 
+
+def _classificar_falha_fonte(e):
+    nome = type(e).__name__
+    msg = str(e)
+    msg_lower = msg.lower()
+    if "TooManyRedirects" in nome or "exceeded 30 redirects" in msg_lower:
+        return {
+            "codigo": "instagram_redirect_loop",
+            "mensagem": "Instagram redirecionou a requisicao repetidamente; sessao/IP provavelmente em challenge ou bloqueio temporario.",
+        }
+    if "JSONDecodeError" in nome or "expecting value" in msg_lower:
+        return {
+            "codigo": "instagram_resposta_nao_json",
+            "mensagem": "Instagram retornou HTML/challenge em vez de JSON para a sessao autenticada.",
+        }
+    if "challenge" in msg_lower:
+        return {
+            "codigo": "instagram_challenge",
+            "mensagem": "Instagram exigiu verificacao/challenge para a sessao atual.",
+        }
+    if "429" in msg_lower or "rate" in msg_lower:
+        return {
+            "codigo": "rate_limited",
+            "mensagem": "Provedor externo limitou as requisicoes.",
+        }
+    return {"codigo": nome, "mensagem": msg[:240]}
+
+
+def _log_falha_fonte(fonte, username, e):
+    erro = _classificar_falha_fonte(e)
+    print(f"[{fonte}] @{username} falhou: {erro['codigo']} - {erro['mensagem']}")
+    return erro
+
+
+def _erro_sem_fonte(detalhes=None):
+    return {
+        "error": "fontes_indisponiveis",
+        "message": "Nenhuma fonte externa retornou dados. RapidAPI pode estar sem cota/limitada e a sessao Instagram pode estar em challenge ou bloqueio temporario.",
+        "details": detalhes or [],
+    }
 # --- Rotação de User-Agent ---------------------------------------------------
 
 _USER_AGENTS = [
@@ -422,6 +463,21 @@ def _fetch_profile_via_api(username):
                 }
     except Exception as e:
         print(f"[IG-API] erro: {e}")
+    return None
+
+
+def _obter_pk(username):
+    """Obtem o pk do usuario pela API privada (web_profile_info), evitando o
+    cl.user_id_from_username do instagrapi — que cai no endpoint publico
+    (public_a1_request) e estoura TooManyRedirects quando o Instagram redireciona
+    o request publico para a tela de login. O path de posts ja usa essa mesma
+    rota privada com sucesso."""
+    if username in _PK_CACHE:
+        return _PK_CACHE[username]
+    perfil = _fetch_profile_via_api(username)
+    if perfil and perfil.get("pk"):
+        _PK_CACHE[username] = perfil["pk"]
+        return _PK_CACHE[username]
     return None
 
 
@@ -907,8 +963,8 @@ class InstagramHandler(BaseHTTPRequestHandler):
             if not username:
                 self.send_json({"error": "username required"}, 400)
                 return
-            data = None
-            if LOGIN_OK:
+            data = fetch_profile_public(username)
+            if (not data or data.get("error")) and LOGIN_OK:
                 try:
                     user = cl.user_info_by_username(username)
                     data = {
@@ -927,9 +983,7 @@ class InstagramHandler(BaseHTTPRequestHandler):
                 except (LoginRequired, ClientLoginRequired):
                     _invalidar_sessao()
                 except Exception as e:
-                    print(f"instagrapi profile error: {e}")
-            if data is None:
-                data = fetch_profile_public(username)
+                    _log_falha_fonte("INSTAGRAPI-PROFILE", username, e)
             if data and data.get("error") == "rate_limited":
                 self.send_json(data, 429)
             elif data and data.get("error") == "auth_required":
@@ -967,7 +1021,7 @@ class InstagramHandler(BaseHTTPRequestHandler):
                 except (LoginRequired, ClientLoginRequired):
                     _invalidar_sessao()
                 except Exception as e:
-                    print(f"instagrapi posts error: {e}")
+                    _log_falha_fonte("INSTAGRAPI-POSTS", username, e)
             # Fallback V1: usa pk da API privada para pular lookup público bloqueado
             if not posts and LOGIN_OK:
                 try:
@@ -990,7 +1044,7 @@ class InstagramHandler(BaseHTTPRequestHandler):
                 except (LoginRequired, ClientLoginRequired):
                     _invalidar_sessao()
                 except Exception as e:
-                    print(f"posts fallback V1 error: {e}")
+                    _log_falha_fonte("INSTAGRAPI-POSTS-V1", username, e)
             # Fallback V2: RapidAPI Stable Scraper
             if not posts:
                 posts = _fetch_posts_rapidapi(username, amount)
@@ -1023,8 +1077,22 @@ class InstagramHandler(BaseHTTPRequestHandler):
             chaves_req = [k.strip() for k in params.get("keys", [""])[0].split(",") if k.strip()]
             print(f"[/followers] @{username} amount={amount} chaves={len(chaves_req)}")
             data = _fetch_lista_rapidapi(username, "followers", amount, chaves_override=chaves_req)
+            if not data and LOGIN_OK:
+                print(f"[/followers] RapidAPI sem dados — tentando instagrapi (sessao autenticada)")
+                try:
+                    user_pk = _obter_pk(username)
+                    if not user_pk:
+                        raise Exception("pk indisponivel (perfil privado/challenge/rate-limit)")
+                    print(f"[/followers] instagrapi pk={user_pk} para @{username}")
+                    raw = cl.user_followers(user_pk, amount=amount)
+                    data = [{"username": f.username, "full_name": f.full_name or ""}
+                            for f in raw.values()]
+                    print(f"[/followers] instagrapi → {len(data)} seguidores de @{username}")
+                except Exception as e:
+                    _log_falha_fonte("INSTAGRAPI-FOLLOWERS", username, e)
+                    _PK_CACHE.pop(username, None)  # invalida cache se falhou
             if not data:
-                self.send_json({"error": "RapidAPI nao retornou dados (rate limit ou chave invalida)"}, 503)
+                self.send_json(_erro_sem_fonte(["rapidapi", "instagrapi"]), 503)
                 return
             print(f"[/followers] @{username} → {len(data)} registros retornados")
             self.send_json({"followers": data, "count": len(data)})
@@ -1038,8 +1106,22 @@ class InstagramHandler(BaseHTTPRequestHandler):
             chaves_req = [k.strip() for k in params.get("keys", [""])[0].split(",") if k.strip()]
             print(f"[/following] @{username} amount={amount} chaves={len(chaves_req)}")
             data = _fetch_lista_rapidapi(username, "following", amount, chaves_override=chaves_req)
+            if not data and LOGIN_OK:
+                print(f"[/following] RapidAPI sem dados — tentando instagrapi (sessao autenticada)")
+                try:
+                    user_pk = _obter_pk(username)
+                    if not user_pk:
+                        raise Exception("pk indisponivel (perfil privado/challenge/rate-limit)")
+                    print(f"[/following] instagrapi pk={user_pk} para @{username}")
+                    raw = cl.user_following(user_pk, amount=amount)
+                    data = [{"username": f.username, "full_name": f.full_name or ""}
+                            for f in raw.values()]
+                    print(f"[/following] instagrapi → {len(data)} seguindo de @{username}")
+                except Exception as e:
+                    _log_falha_fonte("INSTAGRAPI-FOLLOWING", username, e)
+                    _PK_CACHE.pop(username, None)  # invalida cache se falhou
             if not data:
-                self.send_json({"error": "RapidAPI nao retornou dados (rate limit ou chave invalida)"}, 503)
+                self.send_json(_erro_sem_fonte(["rapidapi", "instagrapi"]), 503)
                 return
             print(f"[/following] @{username} → {len(data)} registros retornados")
             self.send_json({"following": data, "count": len(data)})
