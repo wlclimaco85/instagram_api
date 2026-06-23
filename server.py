@@ -1084,9 +1084,12 @@ class InstagramHandler(BaseHTTPRequestHandler):
                     if not user_pk:
                         raise Exception("pk indisponivel (perfil privado/challenge/rate-limit)")
                     print(f"[/followers] instagrapi pk={user_pk} para @{username}")
-                    raw = cl.user_followers(user_pk, amount=amount)
+                    # user_followers_v1 usa /api/v1/friendships/{id}/followers/ (API privada mobile)
+                    # em vez do GQL publico que gera TooManyRedirects quando o Instagram
+                    # redireciona o request publico para a tela de login/challenge.
+                    raw = cl.user_followers_v1(user_pk, amount=amount)
                     data = [{"username": f.username, "full_name": f.full_name or ""}
-                            for f in raw.values()]
+                            for f in raw]
                     print(f"[/followers] instagrapi → {len(data)} seguidores de @{username}")
                 except Exception as e:
                     _log_falha_fonte("INSTAGRAPI-FOLLOWERS", username, e)
@@ -1113,9 +1116,10 @@ class InstagramHandler(BaseHTTPRequestHandler):
                     if not user_pk:
                         raise Exception("pk indisponivel (perfil privado/challenge/rate-limit)")
                     print(f"[/following] instagrapi pk={user_pk} para @{username}")
-                    raw = cl.user_following(user_pk, amount=amount)
+                    # user_following_v1 usa /api/v1/friendships/{id}/following/ (API privada mobile)
+                    raw = cl.user_following_v1(user_pk, amount=amount)
                     data = [{"username": f.username, "full_name": f.full_name or ""}
-                            for f in raw.values()]
+                            for f in raw]
                     print(f"[/following] instagrapi → {len(data)} seguindo de @{username}")
                 except Exception as e:
                     _log_falha_fonte("INSTAGRAPI-FOLLOWING", username, e)
