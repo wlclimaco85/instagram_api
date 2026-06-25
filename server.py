@@ -957,6 +957,26 @@ class InstagramHandler(BaseHTTPRequestHandler):
                 "username": cl.username if LOGIN_OK and cl else None,
             })
 
+        elif parsed.path == "/source_status":
+            chaves_info = [{"indice": i+1, "sufixo": k[-6:]} for i, k in enumerate(_RAPIDAPI_KEYS)]
+            sessoes_info = [
+                {"label": s["label"], "has_error": s.get("has_error", False), "is_active": (i == _sessao_idx)}
+                for i, s in enumerate(_sessoes)
+            ]
+            self.send_json({
+                "rapidapi": {
+                    "configured": len(_RAPIDAPI_KEYS) > 0,
+                    "total_chaves": len(_RAPIDAPI_KEYS),
+                    "chaves": chaves_info,
+                },
+                "session": {
+                    "login_ok": LOGIN_OK,
+                    "total_sessions": len(_sessoes),
+                    "active_session": _sessoes[_sessao_idx]["label"] if _sessoes else None,
+                    "sessions": sessoes_info,
+                },
+            })
+
         elif parsed.path == "/sessions":
             self.send_json({
                 "total": len(_sessoes),
@@ -1092,6 +1112,7 @@ class InstagramHandler(BaseHTTPRequestHandler):
             chaves_req = [k.strip() for k in params.get("keys", [""])[0].split(",") if k.strip()]
             print(f"[/followers] @{username} amount={amount} chaves={len(chaves_req)}")
             data = _fetch_lista_rapidapi(username, "followers", amount, chaves_override=chaves_req)
+            fonte = "rapidapi"
             if not data and LOGIN_OK:
                 print(f"[/followers] RapidAPI sem dados — tentando instagrapi (sessao autenticada)")
                 try:
@@ -1105,15 +1126,23 @@ class InstagramHandler(BaseHTTPRequestHandler):
                     raw = cl.user_followers_v1(user_pk, amount=amount)
                     data = [{"username": f.username, "full_name": f.full_name or ""}
                             for f in raw]
+                    fonte = "instagrapi"
                     print(f"[/followers] instagrapi → {len(data)} seguidores de @{username}")
                 except Exception as e:
                     _log_falha_fonte("INSTAGRAPI-FOLLOWERS", username, e)
                     _PK_CACHE.pop(username, None)  # invalida cache se falhou
             if not data:
-                self.send_json(_erro_sem_fonte(["rapidapi", "instagrapi"]), 503)
+                self.send_json({
+                    "followers": [], "count": 0,
+                    "status": "VAZIA", "source": "none",
+                    "reason": "fontes_indisponiveis", "expectedCount": amount,
+                })
                 return
-            print(f"[/followers] @{username} → {len(data)} registros retornados")
-            self.send_json({"followers": data, "count": len(data)})
+            status = "COMPLETA" if len(data) >= amount else "TRUNCADA"
+            print(f"[/followers] @{username} → {len(data)} registros (status={status})")
+            self.send_json({"followers": data, "count": len(data),
+                            "status": status, "source": fonte,
+                            "reason": "ok", "expectedCount": amount})
 
         elif parsed.path == "/following":
             username = params.get("username", [""])[0]
@@ -1124,6 +1153,7 @@ class InstagramHandler(BaseHTTPRequestHandler):
             chaves_req = [k.strip() for k in params.get("keys", [""])[0].split(",") if k.strip()]
             print(f"[/following] @{username} amount={amount} chaves={len(chaves_req)}")
             data = _fetch_lista_rapidapi(username, "following", amount, chaves_override=chaves_req)
+            fonte = "rapidapi"
             if not data and LOGIN_OK:
                 print(f"[/following] RapidAPI sem dados — tentando instagrapi (sessao autenticada)")
                 try:
@@ -1135,15 +1165,23 @@ class InstagramHandler(BaseHTTPRequestHandler):
                     raw = cl.user_following_v1(user_pk, amount=amount)
                     data = [{"username": f.username, "full_name": f.full_name or ""}
                             for f in raw]
+                    fonte = "instagrapi"
                     print(f"[/following] instagrapi → {len(data)} seguindo de @{username}")
                 except Exception as e:
                     _log_falha_fonte("INSTAGRAPI-FOLLOWING", username, e)
                     _PK_CACHE.pop(username, None)  # invalida cache se falhou
             if not data:
-                self.send_json(_erro_sem_fonte(["rapidapi", "instagrapi"]), 503)
+                self.send_json({
+                    "following": [], "count": 0,
+                    "status": "VAZIA", "source": "none",
+                    "reason": "fontes_indisponiveis", "expectedCount": amount,
+                })
                 return
-            print(f"[/following] @{username} → {len(data)} registros retornados")
-            self.send_json({"following": data, "count": len(data)})
+            status = "COMPLETA" if len(data) >= amount else "TRUNCADA"
+            print(f"[/following] @{username} → {len(data)} registros (status={status})")
+            self.send_json({"following": data, "count": len(data),
+                            "status": status, "source": fonte,
+                            "reason": "ok", "expectedCount": amount})
 
         elif parsed.path == "/rapidapi_status":
             # Diagnostico: testa cada chave isoladamente (1 request por chave)
