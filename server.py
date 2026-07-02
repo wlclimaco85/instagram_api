@@ -291,7 +291,7 @@ def _fetch_com_chave(username, tipo, amount, chave):
             print(f"{label} @{username} pag {pagina}: lista vazia — fim da paginacao")
             break
         lote = [
-            {"username": u.get("username", ""), "full_name": u.get("full_name", u.get("name", ""))}
+            {"username": u.get("username", ""), "full_name": u.get("full_name") or u.get("name") or u.get("username", "")}
             for u in usuarios
             if u.get("username") and u.get("username") not in vistos
         ]
@@ -482,17 +482,37 @@ def _fetch_profile_via_api(username):
 
 
 def _obter_pk(username):
-    """Obtem o pk do usuario pela API privada (web_profile_info), evitando o
-    cl.user_id_from_username do instagrapi — que cai no endpoint publico
-    (public_a1_request) e estoura TooManyRedirects quando o Instagram redireciona
-    o request publico para a tela de login. O path de posts ja usa essa mesma
-    rota privada com sucesso."""
+    """Obtem o pk do usuario.
+    1) Cache local
+    2) API privada publica (web_profile_info) — funciona sem cookies em IPs limpos
+    3) fetch_profile_public — usa cache + 3 metodos de fallback (API → GQL → HTML)
+    4) cl.user_info_by_username_v1 — usa sessao autenticada do instagrapi
+    """
     if username in _PK_CACHE:
         return _PK_CACHE[username]
+
     perfil = _fetch_profile_via_api(username)
-    if perfil and perfil.get("pk"):
+    if perfil and not perfil.get("error") and perfil.get("pk"):
         _PK_CACHE[username] = perfil["pk"]
         return _PK_CACHE[username]
+
+    # Fallback: fetch_profile_public tem cache + API + GQL + HTML
+    perfil = fetch_profile_public(username)
+    if perfil and not perfil.get("error") and perfil.get("pk"):
+        _PK_CACHE[username] = perfil["pk"]
+        return _PK_CACHE[username]
+
+    # Ultimo recurso: usar o client instagrapi autenticado
+    if LOGIN_OK:
+        try:
+            info = cl.user_info_by_username_v1(username)
+            pk = str(info.pk)
+            _PK_CACHE[username] = pk
+            print(f"[_obter_pk] instagrapi v1 → pk={pk} para @{username}")
+            return pk
+        except Exception as e:
+            print(f"[_obter_pk] instagrapi v1 falhou para @{username}: {type(e).__name__}: {e}")
+
     return None
 
 
@@ -1124,7 +1144,7 @@ class InstagramHandler(BaseHTTPRequestHandler):
                     # em vez do GQL publico que gera TooManyRedirects quando o Instagram
                     # redireciona o request publico para a tela de login/challenge.
                     raw = cl.user_followers_v1(user_pk, amount=amount)
-                    data = [{"username": f.username, "full_name": f.full_name or ""}
+                    data = [{"username": f.username, "full_name": f.full_name or f.username}
                             for f in raw]
                     fonte = "instagrapi"
                     print(f"[/followers] instagrapi → {len(data)} seguidores de @{username}")
@@ -1163,7 +1183,7 @@ class InstagramHandler(BaseHTTPRequestHandler):
                     print(f"[/following] instagrapi pk={user_pk} para @{username}")
                     # user_following_v1 usa /api/v1/friendships/{id}/following/ (API privada mobile)
                     raw = cl.user_following_v1(user_pk, amount=amount)
-                    data = [{"username": f.username, "full_name": f.full_name or ""}
+                    data = [{"username": f.username, "full_name": f.full_name or f.username}
                             for f in raw]
                     fonte = "instagrapi"
                     print(f"[/following] instagrapi → {len(data)} seguindo de @{username}")
