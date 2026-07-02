@@ -226,20 +226,16 @@ def _fetch_posts_rapidapi(username, amount=12):
 _MAX_RETRY_RAPIDAPI = 5
 
 
-def _post_rapidapi_com_retry(chave, username, tipo, tamanho, start_from, label, pagina):
+def _post_rapidapi_com_retry(chave, username, tipo, tamanho, pagination_token, label, pagina):
     """POST a RapidAPI com retry/backoff exponencial para erros TRANSITORIOS do
     provedor ('Please try again later', HTTP 5xx). Erros PERMANENTES (429 rate
     limit, cota esgotada, bloqueio) NAO sao retentados — desiste logo da chave
     para o fallback passar para a proxima. Retorna o payload em caso de sucesso
     ou None se falhou de vez.
 
-    Usa get_ig_user_followers.php / get_ig_user_following.php (endpoints basicos)
-    ao inves do v2 — o v2 exige plano superior e retorna 'try again later' para
-    chaves de plano basico mesmo pagas.
+    Usa get_ig_user_followers_v2.php — paginacao por pagination_token (string).
     """
-    # Mesmo endpoint para followers e following — o param data=tipo distingue o tipo.
-    # get_ig_user_following.php nao existe (404 confirmado em teste).
-    endpoint = "get_ig_user_followers.php"
+    endpoint = "get_ig_user_followers_v2.php"
     for tentativa in range(1, _MAX_RETRY_RAPIDAPI + 1):
         try:
             r = http_requests.post(
@@ -249,8 +245,7 @@ def _post_rapidapi_com_retry(chave, username, tipo, tamanho, start_from, label, 
                     "username_or_url": username,
                     "data": tipo,
                     "amount": tamanho,
-                    "start_from": start_from,
-                    "search_query": "",
+                    "pagination_token": pagination_token,
                 },
                 timeout=35,
                 verify=False,
@@ -311,14 +306,14 @@ def _fetch_com_chave(username, tipo, amount, chave):
     """
     todos = []
     vistos: set = set()
-    start_from = 0
+    pagination_token = ""
     pagina = 0
     label = f"[RAPIDAPI-{tipo.upper()}][k={chave[-6:]}]"
     while len(todos) < amount:
         pagina += 1
         tamanho = min(200, amount - len(todos))
         payload = _post_rapidapi_com_retry(
-            chave, username, tipo, tamanho, start_from, label, pagina)
+            chave, username, tipo, tamanho, pagination_token, label, pagina)
         if not payload:
             break
         if pagina == 1:
@@ -335,11 +330,10 @@ def _fetch_com_chave(username, tipo, amount, chave):
         vistos.update(u["username"] for u in lote)
         todos.extend(lote)
         print(f"{label} @{username} pag {pagina}: +{len(lote)} novos ({len(todos)} total)")
-        # Paginacao por offset: avanca pelo numero de itens recebidos.
-        # Pagina incompleta (recebeu menos que pediu) = ultima pagina disponivel.
-        start_from += len(usuarios)
-        if len(usuarios) < tamanho:
-            print(f"{label} @{username}: pagina incompleta ({len(usuarios)}/{tamanho}) — fim dos dados")
+        # Paginacao por token: v2 retorna pagination_token para proxima pagina.
+        pagination_token = payload.get("pagination_token") or ""
+        if not pagination_token:
+            print(f"{label} @{username}: sem proximo token — fim dos dados")
             break
     return todos
 
