@@ -9,11 +9,48 @@ import random
 import sqlite3
 import sys
 import time
+import threading
 import requests as http_requests
 import urllib3
 from datetime import datetime, timedelta
 from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
+
+# ─── Log de respostas da API ────────────────────────────────────────────────
+_LOG_API_PATH = os.path.join(os.path.dirname(__file__), "api_responses.log")
+_log_api_lock = threading.Lock()
+
+def _registrar_resposta_api(endpoint: str, status: int, dados: dict) -> None:
+    """Grava cada resposta num log amigável para facilitar diagnóstico."""
+    try:
+        agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        usuarios = dados.get("followers") or dados.get("following") or []
+        nomes = [
+            u.get("full_name") or u.get("username", "?")
+            for u in (usuarios if isinstance(usuarios, list) else [])
+        ][:5]
+        resumo_nomes = ", ".join(nomes) + ("..." if len(usuarios) > 5 else "") if nomes else "-"
+        api_status = dados.get("status", "-")
+        fonte = dados.get("source", "-")
+        contagem = dados.get("count", len(usuarios) if isinstance(usuarios, list) else "-")
+        esperado = dados.get("expectedCount", "-")
+        erro = dados.get("error") or dados.get("detail", "")
+
+        linha = (
+            f"[{agora}] {endpoint} HTTP={status} status={api_status} fonte={fonte} "
+            f"count={contagem}/{esperado} nomes=[{resumo_nomes}]"
+        )
+        if erro:
+            linha += f" erro={str(erro)[:120]}"
+        linha += "\n"
+
+        with _log_api_lock:
+            with open(_LOG_API_PATH, "a", encoding="utf-8") as f:
+                f.write(linha)
+    except Exception:
+        pass  # log nunca deve derrubar a resposta real
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 # Força UTF-8 no console: sem isto, o cp1252 do Windows quebra o print() ao logar
 # mensagens de erro com '→'/emoji, mascarando a causa real do erro (charmap codec).
@@ -1574,6 +1611,7 @@ class InstagramHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def send_json(self, data, status=200):
+        _registrar_resposta_api(self.path.split("?")[0], status, data if isinstance(data, dict) else {})
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
